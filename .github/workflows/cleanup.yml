@@ -1,0 +1,15 @@
+name: Cleanup Stuck Runs
+
+on:
+  workflow_dispatch: # 支持在网页上手动点击按钮触发
+
+jobs:
+  delete_stuck_runs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete stuck workflow runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 获取仓库下所有 queued 状态的运行 ID 并强行删除
+          gh api repos/${{ github.repository }}/actions/runs?status=queued --jq '.workflow_runs[].id' | xargs -r -I {} gh api -X DELETE repos/${{ github.repository }}/actions/runs/{} || true
