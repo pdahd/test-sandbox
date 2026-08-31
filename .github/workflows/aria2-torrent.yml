@@ -1,0 +1,692 @@
+name: 🧲 Aria2 Torrent Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: >-
+          必填：输入 magnet 链接、.torrent 直链，或完整单条 curl 命令。
+          curl 示例：curl -L -OJ -e "https://example.com/page" "https://example.com/file"
+        required: true
+        type: string
+
+      mode:
+        description: 运行模式
+        required: true
+        default: parse
+        type: choice
+        options:
+          - parse
+          - download_all
+          - download_selected
+
+      file_ids:
+        description: >-
+          download_selected 模式必填。填写 parse 输出中的文件 ID。
+          支持逗号和范围，例如：1,3,5-8
+        required: false
+        default: ""
+        type: string
+
+      metadata_timeout:
+        description: 磁力链接获取 metadata 的最长时间（秒）
+        required: false
+        default: "300"
+        type: string
+
+      seed_time:
+        description: 下载完成后继续做种秒数；0 表示下载完成即退出
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  aria2:
+    name: "${{ inputs.mode }} · Aria2"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      INPUT_SOURCE: ${{ inputs.source }}
+      INPUT_MODE: ${{ inputs.mode }}
+      INPUT_FILE_IDS: ${{ inputs.file_ids }}
+      INPUT_METADATA_TIMEOUT: ${{ inputs.metadata_timeout }}
+      INPUT_SEED_TIME: ${{ inputs.seed_time }}
+
+      WORK_DIR: ${{ github.workspace }}/aria2-work
+      TORRENT_DIR: ${{ github.workspace }}/aria2-work/torrents
+      META_DIR: ${{ github.workspace }}/aria2-work/metadata
+      OUTPUT_DIR: ${{ github.workspace }}/downloads
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 aria2
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl
+
+          echo "==== aria2 版本 ===="
+          aria2c --version | head -n 3
+
+          echo "==== curl 版本 ===="
+          curl --version | head -n 1
+
+      - name: 创建工作目录
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$WORK_DIR"
+          mkdir -p "$TORRENT_DIR"
+          mkdir -p "$META_DIR"
+          mkdir -p "$OUTPUT_DIR"
+
+          echo "WORK_DIR=$WORK_DIR"
+          echo "OUTPUT_DIR=$OUTPUT_DIR"
+
+      - name: 创建种子解析脚本
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cat > "$WORK_DIR/parse_torrent.py" <<'PY'
+          #!/usr/bin/env python3
+          import sys
+          import json
+          from pathlib import Path
+
+
+          def bdecode(data: bytes):
+              def parse(pos):
+                  if pos >= len(data):
+                      raise ValueError("bencode 数据意外结束")
+
+                  ch = data[pos:pos + 1]
+
+                  if ch == b"i":
+                      end = data.index(b"e", pos)
+                      return int(data[pos + 1:end]), end + 1
+
+                  if ch == b"l":
+                      pos += 1
+                      result = []
+                      while data[pos:pos + 1] != b"e":
+                          item, pos = parse(pos)
+                          result.append(item)
+                      return result, pos + 1
+
+                  if ch == b"d":
+                      pos += 1
+                      result = {}
+                      while data[pos:pos + 1] != b"e":
+                          key, pos = parse(pos)
+                          value, pos = parse(pos)
+                          result[key] = value
+                      return result, pos + 1
+
+                  if ch.isdigit():
+                      colon = data.index(b":", pos)
+                      length = int(data[pos:colon])
+                      start = colon + 1
+                      end = start + length
+                      return data[start:end], end
+
+                  raise ValueError(f"无效 bencode 字节，位置: {pos}")
+
+              value, _ = parse(0)
+              return value
+
+
+          def text(value):
+              if isinstance(value, bytes):
+                  return value.decode("utf-8", "replace")
+              if value is None:
+                  return ""
+              return str(value)
+
+
+          def human_size(size):
+              value = float(size)
+              for unit in ("B", "KB", "MB", "GB", "TB"):
+                  if value < 1024 or unit == "TB":
+                      if unit == "B":
+                          return f"{value:.0f} {unit}"
+                      return f"{value:.2f} {unit}"
+                  value /= 1024
+              return f"{value:.2f} TB"
+
+
+          def parse_torrent(path):
+              raw = Path(path).read_bytes()
+
+              if not raw.startswith(b"d"):
+                  raise ValueError("文件不是有效的 bencode torrent 数据")
+
+              meta = bdecode(raw)
+
+              if not isinstance(meta, dict) or b"info" not in meta:
+                  raise ValueError("torrent 中缺少 info 字段")
+
+              info = meta[b"info"]
+
+              if not isinstance(info, dict):
+                  raise ValueError("torrent 的 info 字段无效")
+
+              torrent_name = text(info.get(b"name.utf-8", info.get(b"name", "未命名")))
+
+              files = []
+
+              if b"files" in info:
+                  entries = info[b"files"]
+
+                  if not isinstance(entries, list):
+                      raise ValueError("torrent 的 files 字段无效")
+
+                  for index, entry in enumerate(entries, start=1):
+                      if not isinstance(entry, dict):
+                          continue
+
+                      path_key = b"path.utf-8" if b"path.utf-8" in entry else b"path"
+                      parts = entry.get(path_key, [])
+
+                      if not isinstance(parts, list):
+                          parts = []
+
+                      relative_path = "/".join(text(part) for part in parts)
+
+                      if not relative_path:
+                          relative_path = f"file_{index}"
+
+                      files.append({
+                          "id": index,
+                          "path": relative_path,
+                          "size": int(entry.get(b"length", 0)),
+                          "size_text": human_size(int(entry.get(b"length", 0))),
+                      })
+
+              else:
+                  length = int(info.get(b"length", 0))
+                  files.append({
+                      "id": 1,
+                      "path": torrent_name,
+                      "size": length,
+                      "size_text": human_size(length),
+                  })
+
+              total = sum(item["size"] for item in files)
+
+              return {
+                  "torrent_name": torrent_name,
+                  "file_count": len(files),
+                  "total_size": total,
+                  "total_size_text": human_size(total),
+                  "files": files,
+              }
+
+
+          if __name__ == "__main__":
+              if len(sys.argv) < 2:
+                  raise SystemExit("用法: parse_torrent.py <torrent文件> [--json]")
+
+              result = parse_torrent(sys.argv[1])
+
+              if "--json" in sys.argv:
+                  print(json.dumps(result, ensure_ascii=False))
+                  raise SystemExit(0)
+
+              print("")
+              print("=" * 92)
+              print(f"种子名称: {result['torrent_name']}")
+              print(f"文件数量: {result['file_count']}")
+              print(f"总大小  : {result['total_size_text']}")
+              print("=" * 92)
+              print(f"{'ID':>5} | {'大小':>12} | 文件路径")
+              print("-" * 92)
+
+              for item in result["files"]:
+                  print(f"{item['id']:>5} | {item['size_text']:>12} | {item['path']}")
+
+              print("=" * 92)
+              print("download_selected 模式示例:")
+              print("  file_ids: 1,3,5-8")
+              print("=" * 92)
+          PY
+
+          chmod +x "$WORK_DIR/parse_torrent.py"
+
+      - name: 获取种子或磁力链接
+        id: source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SOURCE="$INPUT_SOURCE"
+
+          echo "输入来源类型检测中..."
+
+          if [[ "$SOURCE" == magnet:\?* ]]; then
+            echo "source_kind=magnet" >> "$GITHUB_OUTPUT"
+            echo "source_value=$SOURCE" >> "$GITHUB_OUTPUT"
+
+            echo "检测到 magnet 链接。"
+            echo "磁力链接将在后续步骤中直接下载，或先抓取 metadata 后解析。"
+            exit 0
+          fi
+
+          if [[ "$SOURCE" == http://* || "$SOURCE" == https://* ]]; then
+            echo "检测到 HTTP(S) 种子直链。"
+
+            cd "$TORRENT_DIR"
+
+            curl \
+              --location \
+              --fail \
+              --retry 3 \
+              --retry-delay 2 \
+              --remote-name \
+              --remote-header-name \
+              "$SOURCE"
+
+          elif [[ "$SOURCE" == curl\ * ]]; then
+            echo "检测到 curl 命令。"
+            echo "安全说明：命令将通过 shlex 拆分后执行，不经 shell eval。"
+            echo "请确保 curl 使用 -O、-OJ 或 -o，并把种子保存到当前工作目录。"
+
+            export CURL_COMMAND="$SOURCE"
+
+            python3 - <<'PY'
+          import os
+          import shlex
+          import subprocess
+          import sys
+
+          command = os.environ["CURL_COMMAND"].replace("\\\n", " ").strip()
+
+          try:
+              args = shlex.split(command)
+          except ValueError as exc:
+              print(f"curl 命令解析失败: {exc}", file=sys.stderr)
+              raise SystemExit(2)
+
+          if not args or args[0] != "curl":
+              print("命令必须以 curl 开头", file=sys.stderr)
+              raise SystemExit(2)
+
+          # 防止用户把 shell 操作符作为参数误用。
+          forbidden = {"&&", "||", ";", "|", "`", "$("}
+          if any(token in forbidden for token in args):
+              print("curl 命令不能含 &&、||、;、|、`、$( 等 shell 操作符", file=sys.stderr)
+              raise SystemExit(2)
+
+          print("实际执行参数:", args)
+          result = subprocess.run(args, check=False)
+
+          if result.returncode != 0:
+              raise SystemExit(result.returncode)
+          PY
+
+          else
+            echo "::error::输入必须是 magnet 链接、http(s) 种子直链，或以 curl 开头的单条 curl 命令。"
+            exit 1
+          fi
+
+          echo "正在查找 curl 下载得到的有效种子文件..."
+
+          TORRENT_FILE="$(
+            python3 - "$TORRENT_DIR" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          candidates = []
+
+          for item in root.iterdir():
+              if not item.is_file():
+                  continue
+              try:
+                  with item.open("rb") as fp:
+                      header = fp.read(1)
+                  if header == b"d":
+                      candidates.append(item)
+              except OSError:
+                  pass
+
+          if not candidates:
+              raise SystemExit(1)
+
+          candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+
+          # 只使用最新生成的一个有效 torrent 文件。
+          print(str(candidates[0]))
+          PY
+          )"
+
+          if [[ -z "$TORRENT_FILE" || ! -f "$TORRENT_FILE" ]]; then
+            echo "::error::未找到有效 .torrent 文件。请检查 curl 命令、跳转链接、Cookie、Referer 或防盗链设置。"
+            echo "当前目录内容："
+            ls -lah "$TORRENT_DIR" || true
+            exit 1
+          fi
+
+          # 统一复制为 source.torrent，避免原始文件名编码或后缀问题。
+          cp "$TORRENT_FILE" "$TORRENT_DIR/source.torrent"
+
+          echo "source_kind=torrent" >> "$GITHUB_OUTPUT"
+          echo "source_value=$TORRENT_DIR/source.torrent" >> "$GITHUB_OUTPUT"
+
+          echo "获取成功：$TORRENT_FILE"
+          ls -lh "$TORRENT_DIR/source.torrent"
+
+      - name: 磁力链接获取 metadata
+        id: metadata
+        if: ${{ steps.source.outputs.source_kind == 'magnet' && (inputs.mode == 'parse' || inputs.mode == 'download_selected') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$META_DIR"
+
+          echo "开始获取磁力 metadata ..."
+          echo "最长等待: ${INPUT_METADATA_TIMEOUT} 秒"
+
+          aria2c \
+            --bt-metadata-only=true \
+            --bt-save-metadata=true \
+            --seed-time=0 \
+            --bt-stop-timeout="$INPUT_METADATA_TIMEOUT" \
+            --timeout=60 \
+            --connect-timeout=30 \
+            --summary-interval=5 \
+            --console-log-level=notice \
+            --dir="$META_DIR" \
+            "${{ steps.source.outputs.source_value }}"
+
+          META_TORRENT="$(
+            python3 - "$META_DIR" <<'PY'
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+
+          candidates = []
+          for item in root.rglob("*"):
+              if not item.is_file():
+                  continue
+              try:
+                  if item.read_bytes()[:1] == b"d":
+                      candidates.append(item)
+              except OSError:
+                  pass
+
+          if not candidates:
+              raise SystemExit(1)
+
+          candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+          print(str(candidates[0]))
+          PY
+          )"
+
+          if [[ -z "$META_TORRENT" || ! -f "$META_TORRENT" ]]; then
+            echo "::error::未获取到磁力 metadata。可能没有可用做种者，或 metadata 获取超时。"
+            exit 1
+          fi
+
+          cp "$META_TORRENT" "$TORRENT_DIR/metadata.torrent"
+
+          echo "torrent_path=$TORRENT_DIR/metadata.torrent" >> "$GITHUB_OUTPUT"
+
+          echo "metadata 获取成功："
+          ls -lh "$TORRENT_DIR/metadata.torrent"
+
+      - name: 确定可解析种子路径
+        id: torrent
+        if: ${{ inputs.mode == 'parse' || inputs.mode == 'download_selected' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ "${{ steps.source.outputs.source_kind }}" == "torrent" ]]; then
+            TORRENT="${{ steps.source.outputs.source_value }}"
+          else
+            TORRENT="${{ steps.metadata.outputs.torrent_path }}"
+          fi
+
+          if [[ -z "$TORRENT" || ! -f "$TORRENT" ]]; then
+            echo "::error::无法确定用于解析的 torrent 文件。"
+            exit 1
+          fi
+
+          echo "path=$TORRENT" >> "$GITHUB_OUTPUT"
+          echo "将解析：$TORRENT"
+
+      - name: 种子解析（仅打印文件 ID）
+        if: ${{ inputs.mode == 'parse' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "::group::种子文件清单"
+          python3 "$WORK_DIR/parse_torrent.py" "${{ steps.torrent.outputs.path }}"
+          echo "::endgroup::"
+
+          echo ""
+          echo "解析模式完成。"
+          echo "请记下需要的文件 ID，然后再次手动运行本工作流："
+          echo "  mode: download_selected"
+          echo "  file_ids: 例如 1,3,5-8"
+
+      - name: 验证指定文件 ID
+        id: selected
+        if: ${{ inputs.mode == 'download_selected' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${INPUT_FILE_IDS//[[:space:]]/}" ]]; then
+            echo "::error::download_selected 模式必须填写 file_ids，例如：1,3,5-8"
+            exit 1
+          fi
+
+          export TORRENT_PATH="${{ steps.torrent.outputs.path }}"
+          export IDS_TEXT="$INPUT_FILE_IDS"
+
+          SELECT_CSV="$(
+            python3 - "$WORK_DIR/parse_torrent.py" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          parser = sys.argv[1]
+          torrent = os.environ["TORRENT_PATH"]
+          raw = os.environ["IDS_TEXT"].strip()
+
+          result = subprocess.run(
+              [sys.executable, parser, torrent, "--json"],
+              capture_output=True,
+              text=True,
+              check=True,
+          )
+
+          data = json.loads(result.stdout)
+          valid = {int(item["id"]) for item in data["files"]}
+
+          selected = set()
+
+          for token in re.split(r"[\s,]+", raw):
+              token = token.strip()
+              if not token:
+                  continue
+
+              if re.fullmatch(r"\d+", token):
+                  selected.add(int(token))
+                  continue
+
+              match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", token)
+              if match:
+                  start, end = int(match.group(1)), int(match.group(2))
+
+                  if end < start:
+                      raise SystemExit(f"无效范围: {token}")
+
+                  selected.update(range(start, end + 1))
+                  continue
+
+              raise SystemExit(f"无法识别的文件 ID 格式: {token}")
+
+          invalid = sorted(selected - valid)
+
+          if invalid:
+              raise SystemExit(
+                  "以下文件 ID 不存在于该种子中: " +
+                  ",".join(map(str, invalid))
+              )
+
+          if not selected:
+              raise SystemExit("未选中任何有效文件 ID")
+
+          ordered = sorted(selected)
+
+          print(",".join(map(str, ordered)))
+          PY
+          )"
+
+          echo "select_csv=$SELECT_CSV" >> "$GITHUB_OUTPUT"
+
+          echo "已验证文件 ID：$SELECT_CSV"
+
+          echo "::group::已选文件"
+          python3 - "${{ steps.torrent.outputs.path }}" "$SELECT_CSV" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          torrent_path = sys.argv[1]
+          selected = {int(v) for v in sys.argv[2].split(",")}
+
+          result = subprocess.run(
+              ["python3", "/github/workspace/aria2-work/parse_torrent.py", torrent_path, "--json"],
+              capture_output=True,
+              text=True,
+              check=True,
+          )
+
+          data = json.loads(result.stdout)
+
+          total = 0
+
+          for item in data["files"]:
+              if int(item["id"]) in selected:
+                  total += int(item["size"])
+                  print(f"[{item['id']}] {item['size_text']:>12}  {item['path']}")
+
+          print("-" * 72)
+          print(f"选中 {len(selected)} 项，总大小: {total / 1024 / 1024 / 1024:.2f} GB")
+          PY
+          echo "::endgroup::"
+
+      - name: aria2 下载全部文件
+        if: ${{ inputs.mode == 'download_all' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SOURCE_KIND="${{ steps.source.outputs.source_kind }}"
+          SOURCE_VALUE="${{ steps.source.outputs.source_value }}"
+
+          echo "下载模式：全部文件"
+          echo "输出目录：$OUTPUT_DIR"
+
+          if [[ "$SOURCE_KIND" == "torrent" ]]; then
+            TARGET="$SOURCE_VALUE"
+          else
+            TARGET="$SOURCE_VALUE"
+          fi
+
+          aria2c \
+            --dir="$OUTPUT_DIR" \
+            --seed-time="$INPUT_SEED_TIME" \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=4M \
+            --continue=true \
+            --auto-file-renaming=true \
+            --allow-overwrite=false \
+            --file-allocation=none \
+            --disk-cache=64M \
+            --summary-interval=5 \
+            --console-log-level=notice \
+            --bt-max-peers=120 \
+            --bt-request-peer-speed-limit=20M \
+            --bt-stop-timeout=600 \
+            "$TARGET"
+
+      - name: aria2 下载指定文件
+        if: ${{ inputs.mode == 'download_selected' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          TORRENT="${{ steps.torrent.outputs.path }}"
+          SELECT_CSV="${{ steps.selected.outputs.select_csv }}"
+
+          echo "下载模式：指定文件"
+          echo "指定文件 ID：$SELECT_CSV"
+          echo "输出目录：$OUTPUT_DIR"
+
+          aria2c \
+            --dir="$OUTPUT_DIR" \
+            --seed-time="$INPUT_SEED_TIME" \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=4M \
+            --continue=true \
+            --auto-file-renaming=true \
+            --allow-overwrite=false \
+            --file-allocation=none \
+            --disk-cache=64M \
+            --summary-interval=5 \
+            --console-log-level=notice \
+            --bt-max-peers=120 \
+            --bt-request-peer-speed-limit=20M \
+            --bt-stop-timeout=600 \
+            --select-file="$SELECT_CSV" \
+            --bt-remove-unselected-file=true \
+            "$TORRENT"
+
+      - name: 输出下载目录清单
+        if: ${{ success() && (inputs.mode == 'download_all' || inputs.mode == 'download_selected') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "==== 下载结果 ===="
+
+          if [[ -z "$(find "$OUTPUT_DIR" -mindepth 1 -print -quit)" ]]; then
+            echo "::warning::下载目录为空，未找到可上传文件。"
+          else
+            find "$OUTPUT_DIR" -maxdepth 4 -type f -printf '%s bytes\t%p\n' | sort -n
+          fi
+
+          echo ""
+          echo "==== 总磁盘占用 ===="
+          du -sh "$OUTPUT_DIR" || true
+
+      - name: 上传下载工件
+        if: ${{ success() && (inputs.mode == 'download_all' || inputs.mode == 'download_selected') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aria2-download-${{ github.run_number }}
+          path: downloads/
+          if-no-files-found: warn
+          compression-level: 0
