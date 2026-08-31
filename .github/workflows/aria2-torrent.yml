@@ -72,7 +72,7 @@ jobs:
 
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 安装 aria2 和 curl
         shell: bash
@@ -865,7 +865,7 @@ jobs:
 
       - name: 上传下载工件
         if: ${{ success() && (inputs.mode == 'download_all' || inputs.mode == 'download_selected') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: aria2-download-${{ github.run_number }}
           path: downloads/
