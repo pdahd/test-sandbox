@@ -1,0 +1,1505 @@
+name: 🧲 Aria2 Torrent Downloader-2
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: >-
+          必填：.torrent 直链、种子压缩包直链、普通文件直链、magnet 磁力链，或单条 curl 命令。
+          例如：curl -L -OJ -e "https://example.com/page" "https://example.com/file"
+        required: true
+        type: string
+
+      mode:
+        description: >-
+          运行模式：parse=解析种子；download_all=下载种子全部文件（直链非种子时自动按普通文件下载）；
+          download_selected=下载种子指定文件；http_file=普通文件直链下载
+        required: true
+        default: parse
+        type: choice
+        options:
+          - parse
+          - download_all
+          - download_selected
+          - http_file
+
+      file_ids:
+        description: >-
+          download_selected 模式使用。
+          填写 parse 日志中的文件 ID，例如：1,3,5-8
+        required: false
+        default: ""
+        type: string
+
+      referer:
+        description: >-
+          可选。种子直链 / 文件直链模式的 Referer。留空时自动尝试多种策略。
+          例如：https://dropmefiles.com/Z9E1c
+        required: false
+        default: ""
+        type: string
+
+      torrent_index:
+        description: >-
+          可选。当压缩包内含多个种子时，指定使用第几个（从 1 开始）。
+          留空则自动选择内容总体积最大的那个。
+        required: false
+        default: ""
+        type: string
+
+      metadata_timeout:
+        description: 磁力链接获取 metadata 的最长时间（秒）
+        required: false
+        default: "300"
+        type: string
+
+      seed_time:
+        description: 下载完成后继续做种秒数，0 表示下载完成后退出
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  aria2:
+    name: "${{ inputs.mode }} · Aria2"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      INPUT_SOURCE: ${{ inputs.source }}
+      INPUT_MODE: ${{ inputs.mode }}
+      INPUT_FILE_IDS: ${{ inputs.file_ids }}
+      INPUT_REFERER: ${{ inputs.referer }}
+      INPUT_TORRENT_INDEX: ${{ inputs.torrent_index }}
+      INPUT_METADATA_TIMEOUT: ${{ inputs.metadata_timeout }}
+      INPUT_SEED_TIME: ${{ inputs.seed_time }}
+
+      WORK_DIR: ${{ github.workspace }}/aria2-work
+      TORRENT_DIR: ${{ github.workspace }}/aria2-work/torrents
+      META_DIR: ${{ github.workspace }}/aria2-work/metadata
+      OUTPUT_DIR: ${{ github.workspace }}/downloads
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v5
+
+      - name: 安装 aria2、curl 与解压工具
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl file p7zip-full unzip
+
+          # RAR 支持位于 multiverse，缺失时不影响主流程
+          sudo apt-get install -y -qq p7zip-rar || true
+
+          echo "==== aria2 版本 ===="
+          aria2c --version | head -n 3
+
+          echo "==== curl 版本 ===="
+          curl --version | head -n 1
+
+          echo "==== 解压工具 ===="
+          7z i >/dev/null 2>&1 && echo "7z: 可用" || echo "7z: 不可用"
+          unzip -v | head -n 1 || true
+
+      - name: 创建工作目录
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$WORK_DIR"
+          mkdir -p "$TORRENT_DIR"
+          mkdir -p "$META_DIR"
+          mkdir -p "$OUTPUT_DIR"
+
+          echo "WORK_DIR=$WORK_DIR"
+          echo "TORRENT_DIR=$TORRENT_DIR"
+          echo "OUTPUT_DIR=$OUTPUT_DIR"
+
+      - name: 创建种子解析和验证工具
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cat > "$WORK_DIR/torrent_tools.py" <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import sys
+          from pathlib import Path
+
+
+          class TorrentError(Exception):
+              pass
+
+
+          def bdecode(data: bytes):
+              def parse(pos):
+                  if pos >= len(data):
+                      raise TorrentError(f"bencode 数据意外结束，位置 {pos}")
+
+                  ch = data[pos:pos + 1]
+
+                  if ch == b"i":
+                      end = data.find(b"e", pos + 1)
+                      if end < 0:
+                          raise TorrentError("整数缺少结束符")
+                      raw = data[pos + 1:end]
+                      if not raw:
+                          raise TorrentError("整数为空")
+                      return int(raw), end + 1
+
+                  if ch == b"l":
+                      pos += 1
+                      result = []
+                      while True:
+                          if pos >= len(data):
+                              raise TorrentError("列表意外结束")
+                          if data[pos:pos + 1] == b"e":
+                              return result, pos + 1
+                          value, pos = parse(pos)
+                          result.append(value)
+
+                  if ch == b"d":
+                      pos += 1
+                      result = {}
+                      while True:
+                          if pos >= len(data):
+                              raise TorrentError("字典意外结束")
+                          if data[pos:pos + 1] == b"e":
+                              return result, pos + 1
+                          key, pos = parse(pos)
+                          if not isinstance(key, bytes):
+                              raise TorrentError("字典键不是 bytes")
+                          value, pos = parse(pos)
+                          result[key] = value
+
+                  if b"0" <= ch <= b"9":
+                      colon = data.find(b":", pos)
+                      if colon < 0:
+                          raise TorrentError("字符串长度缺少冒号")
+                      try:
+                          length = int(data[pos:colon])
+                      except Exception:
+                          raise TorrentError("字符串长度无效")
+                      if length < 0:
+                          raise TorrentError("字符串长度不能为负数")
+                      start = colon + 1
+                      end = start + length
+                      if end > len(data):
+                          raise TorrentError("字符串超出数据范围")
+                      return data[start:end], end
+
+                  raise TorrentError(
+                      f"无效 bencode 字节 {data[pos:pos + 1]!r}，位置 {pos}"
+                  )
+
+              value, end_pos = parse(0)
+              trailing = data[end_pos:].strip()
+              if trailing:
+                  raise TorrentError("bencode 数据后存在无法解析的额外内容")
+              return value
+
+
+          def text(value):
+              if isinstance(value, bytes):
+                  return value.decode("utf-8", "replace")
+              if value is None:
+                  return ""
+              return str(value)
+
+
+          def human_size(size):
+              value = float(size)
+              for unit in ("B", "KB", "MB", "GB", "TB"):
+                  if value < 1024 or unit == "TB":
+                      if unit == "B":
+                          return f"{value:.0f} {unit}"
+                      return f"{value:.2f} {unit}"
+                  value /= 1024
+              return f"{value:.2f} TB"
+
+
+          def parse_torrent(path):
+              path = Path(path)
+              if not path.is_file():
+                  raise TorrentError(f"文件不存在：{path}")
+
+              raw = path.read_bytes()
+              meta = bdecode(raw)
+
+              if not isinstance(meta, dict):
+                  raise TorrentError("torrent 顶层不是字典")
+              if b"info" not in meta:
+                  raise TorrentError("torrent 中缺少 info 字段")
+
+              info = meta[b"info"]
+              if not isinstance(info, dict):
+                  raise TorrentError("torrent 的 info 字段不是字典")
+
+              name_raw = info.get(b"name.utf-8", info.get(b"name", b"untitled"))
+              torrent_name = text(name_raw) or "untitled"
+              files = []
+
+              if b"files" in info:
+                  torrent_files = info[b"files"]
+                  if not isinstance(torrent_files, list):
+                      raise TorrentError("torrent 的 files 字段无效")
+
+                  for file_id, item in enumerate(torrent_files, start=1):
+                      if not isinstance(item, dict):
+                          continue
+                      path_key = b"path.utf-8" if b"path.utf-8" in item else b"path"
+                      parts = item.get(path_key, [])
+                      if not isinstance(parts, list):
+                          parts = []
+                      relative_path = "/".join(text(x) for x in parts)
+                      if not relative_path:
+                          relative_path = f"file_{file_id}"
+                      size = int(item.get(b"length", 0))
+                      files.append({
+                          "id": file_id,
+                          "path": relative_path,
+                          "size": size,
+                          "size_text": human_size(size),
+                      })
+              else:
+                  size = int(info.get(b"length", 0))
+                  files.append({
+                      "id": 1,
+                      "path": torrent_name,
+                      "size": size,
+                      "size_text": human_size(size),
+                  })
+
+              total_size = sum(item["size"] for item in files)
+              return {
+                  "torrent_name": torrent_name,
+                  "file_count": len(files),
+                  "total_size": total_size,
+                  "total_size_text": human_size(total_size),
+                  "files": files,
+              }
+
+
+          def print_human(result):
+              print("")
+              print("=" * 110)
+              print(f"种子名称：{result['torrent_name']}")
+              print(f"文件数量：{result['file_count']}")
+              print(f"总大小：  {result['total_size_text']}")
+              print("=" * 110)
+              print(f"{'ID':>6} | {'大小':>14} | 文件路径")
+              print("-" * 110)
+              for item in result["files"]:
+                  print(f"{item['id']:>6} | {item['size_text']:>14} | {item['path']}")
+              print("=" * 110)
+
+
+          if __name__ == "__main__":
+              if len(sys.argv) < 2:
+                  raise SystemExit("用法：torrent_tools.py <torrent文件> [--json]")
+              result = parse_torrent(sys.argv[1])
+              if "--json" in sys.argv:
+                  print(json.dumps(result, ensure_ascii=False))
+              else:
+                  print_human(result)
+          PY
+
+          chmod +x "$WORK_DIR/torrent_tools.py"
+
+          # ---- 普通 HTTP 文件直链下载器（aria2c 主力 + curl 兜底）----
+          cat > "$WORK_DIR/http_file_download.py" <<'PY'
+          #!/usr/bin/env python3
+          """
+          普通文件直链下载：
+            1. 若 source 是 curl 命令：在 OUTPUT_DIR 内安全执行（shlex，不经 shell）
+            2. 若 source 是 http(s) 直链：按 Referer 候选依次尝试
+                 aria2c 多线程 → 失败/HTML 中间页 → curl -L -OJ 兜底
+            3. 下载后校验：非空、非 HTML/JSON 中间页
+          """
+          import os
+          import shlex
+          import subprocess
+          import sys
+          from pathlib import Path
+          from urllib.parse import urlsplit, urlunsplit
+
+          source = os.environ.get("INPUT_SOURCE", "").strip()
+          manual_referer = os.environ.get("INPUT_REFERER", "").strip()
+          out_dir = Path(os.environ["OUTPUT_DIR"])
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          UA = "Mozilla/5.0"
+          HTML_SNIFF_LIMIT = 2 * 1024 * 1024
+
+
+          def human_size(size):
+              value = float(size)
+              for unit in ("B", "KB", "MB", "GB", "TB"):
+                  if value < 1024 or unit == "TB":
+                      return f"{value:.0f} {unit}" if unit == "B" else f"{value:.2f} {unit}"
+                  value /= 1024
+              return f"{value:.2f} TB"
+
+
+          def snapshot():
+              return {p for p in out_dir.rglob("*") if p.is_file()}
+
+
+          def new_files(before):
+              return sorted(snapshot() - before, key=lambda p: p.stat().st_mtime)
+
+
+          def looks_like_page(path):
+              """小体积文本且以 HTML/JSON 开头 → 视为中间页而非目标文件。"""
+              try:
+                  size = path.stat().st_size
+                  if size == 0:
+                      return True
+                  if size > HTML_SNIFF_LIMIT:
+                      return False
+                  head = path.read_bytes()[:512].lstrip().lower()
+              except OSError:
+                  return True
+              return (
+                  head.startswith(b"<!doctype html")
+                  or head.startswith(b"<html")
+                  or head.startswith(b"{\"error")
+                  or head.startswith(b"{\"code")
+              )
+
+
+          def cleanup(files):
+              for f in files:
+                  try:
+                      f.unlink()
+                  except OSError:
+                      pass
+              # aria2 控制文件
+              for f in out_dir.rglob("*.aria2"):
+                  try:
+                      f.unlink()
+                  except OSError:
+                      pass
+
+
+          def validate(files, label):
+              if not files:
+                  print(f"[{label}] 未产生任何文件")
+                  return False
+              bad = [f for f in files if looks_like_page(f)]
+              if bad:
+                  for f in bad:
+                      try:
+                          print(f"[{label}] 疑似中间页/空文件：{f.name} "
+                                f"({f.stat().st_size} bytes) "
+                                f"{f.read_bytes()[:120]!r}")
+                      except OSError:
+                          pass
+                  return False
+              for f in files:
+                  print(f"[{label}] 得到文件：{f.relative_to(out_dir)}  {human_size(f.stat().st_size)}")
+              return True
+
+
+          def probe(url, referer):
+              """HEAD 探测，仅用于日志。"""
+              cmd = ["curl", "-sIL", "--max-time", "60", "-A", UA]
+              if referer is not None:
+                  cmd += ["-e", referer]
+              cmd.append(url)
+              try:
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+                  lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+                  interesting = [
+                      l for l in lines
+                      if l.startswith("HTTP/")
+                      or l.lower().startswith(("content-type:", "content-length:",
+                                               "content-disposition:", "location:"))
+                  ]
+                  if interesting:
+                      print("响应头探测：")
+                      for l in interesting[-8:]:
+                          print("  " + l)
+              except Exception:
+                  pass
+
+
+          def run_aria2(url, referer):
+              cmd = [
+                  "aria2c",
+                  f"--dir={out_dir}",
+                  "--max-connection-per-server=16",
+                  "--split=16",
+                  "--min-split-size=1M",
+                  "--continue=true",
+                  "--max-tries=5",
+                  "--retry-wait=3",
+                  "--timeout=60",
+                  "--connect-timeout=30",
+                  "--auto-file-renaming=true",
+                  "--allow-overwrite=false",
+                  "--file-allocation=none",
+                  "--content-disposition-default-utf8=true",
+                  "--remote-time=true",
+                  "--summary-interval=5",
+                  "--console-log-level=notice",
+                  f"--user-agent={UA}",
+              ]
+              if referer is not None:
+                  cmd.append(f"--referer={referer}")
+              cmd.append(url)
+              print("执行 aria2c：", " ".join(shlex.quote(c) for c in cmd))
+              r = subprocess.run(cmd)
+              return r.returncode
+
+
+          def run_curl(url, referer):
+              cmd = [
+                  "curl", "--location", "--fail", "--show-error",
+                  "--retry", "3", "--retry-delay", "2",
+                  "--connect-timeout", "30",
+                  "-A", UA, "-OJ",
+              ]
+              if referer is not None:
+                  cmd += ["-e", referer]
+              cmd.append(url)
+              print("执行 curl：", " ".join(shlex.quote(c) for c in cmd))
+              r = subprocess.run(cmd, cwd=str(out_dir))
+              return r.returncode
+
+
+          def referer_candidates(url):
+              seq = []
+              if manual_referer:
+                  seq.append(("手动指定 Referer", manual_referer))
+              seq.append(("Referer=;auto", ";auto"))
+              parts = urlsplit(url)
+              seq.append(("同源根 Referer", urlunsplit((parts.scheme, parts.netloc, "/", "", ""))))
+              seq.append(("无 Referer", None))
+              seen, uniq = set(), []
+              for label, ref in seq:
+                  key = "" if ref is None else ref
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  uniq.append((label, ref))
+              return uniq
+
+
+          if not source:
+              print("::error::source 不能为空")
+              raise SystemExit(1)
+
+          if source.startswith("magnet:"):
+              print("::error::http_file 模式不支持磁力链接，请改用 download_all")
+              raise SystemExit(1)
+
+          # ---------------- curl 命令 ----------------
+          if source.startswith("curl"):
+              try:
+                  args = shlex.split(source)
+              except ValueError as exc:
+                  raise SystemExit(f"curl 命令解析失败：{exc}")
+              if not args or args[0] != "curl":
+                  raise SystemExit("命令必须以 curl 开头")
+              forbidden = {"&&", "||", ";", "|", "`", "$(", ")"}
+              if any(tok in forbidden for tok in args):
+                  raise SystemExit("curl 命令不能包含 &&、||、;、|、`、$( 等 shell 操作符")
+              has_out = any(
+                  a in ("-O", "-OJ", "-JO", "--remote-name", "--remote-name-all", "--output")
+                  or (a.startswith("-o") and a != "-o") for a in args
+              ) or "-o" in args
+              if not has_out:
+                  print("未检测到 -O/-OJ/-o，自动追加 -L -OJ")
+                  args = ["curl", "-L", "-OJ"] + args[1:]
+
+              before = snapshot()
+              print("在 OUTPUT_DIR 内执行：", args)
+              r = subprocess.run(args, cwd=str(out_dir))
+              if r.returncode != 0:
+                  raise SystemExit(f"curl 退出码 {r.returncode}")
+              got = new_files(before)
+              if not validate(got, "curl 命令"):
+                  raise SystemExit("curl 命令未得到有效文件（可能是 HTML 中间页）")
+              print("文件直链下载成功")
+              raise SystemExit(0)
+
+          # ---------------- http(s) 直链 ----------------
+          if not source.startswith(("http://", "https://")):
+              raise SystemExit("http_file 模式的 source 必须是 http(s) 直链或 curl 命令")
+
+          print("普通文件直链下载：aria2c 多线程优先，curl 兜底")
+
+          for label, ref in referer_candidates(source):
+              print("")
+              print(f"==== 策略：{label} ====")
+              probe(source, ref)
+
+              # 1) aria2c
+              before = snapshot()
+              rc = run_aria2(source, ref)
+              got = new_files(before)
+              if rc == 0 and validate(got, "aria2c"):
+                  print(f"成功：{label} / aria2c")
+                  raise SystemExit(0)
+              print(f"aria2c 未成功（退出码 {rc}），清理后改用 curl 兜底")
+              cleanup(got)
+
+              # 2) curl 兜底
+              before = snapshot()
+              rc = run_curl(source, ref)
+              got = new_files(before)
+              if rc == 0 and validate(got, "curl"):
+                  print(f"成功：{label} / curl")
+                  raise SystemExit(0)
+              print(f"curl 亦未成功（退出码 {rc}），尝试下一个 Referer 策略")
+              cleanup(got)
+
+          print("")
+          print("::error::所有策略均未下载到有效文件")
+          print("常见原因：需要 Cookie/登录态、一次性 token、或链接已过期。")
+          print("建议：从浏览器复制完整 curl 命令（含 -b/-H）作为 source。")
+          raise SystemExit(1)
+          PY
+
+          chmod +x "$WORK_DIR/http_file_download.py"
+
+      - name: 获取并验证种子
+        id: source
+        if: ${{ inputs.mode != 'http_file' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          python3 - "$TORRENT_DIR" "$WORK_DIR/torrent_tools.py" <<'PY'
+          import base64
+          import bz2
+          import gzip
+          import hashlib
+          import json
+          import lzma
+          import os
+          import shlex
+          import shutil
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlsplit, urlunsplit
+
+
+          source = os.environ.get("INPUT_SOURCE", "").strip()
+          manual_referer = os.environ.get("INPUT_REFERER", "").strip()
+          index_raw = os.environ.get("INPUT_TORRENT_INDEX", "").strip()
+          run_mode = os.environ.get("INPUT_MODE", "").strip()
+
+          torrent_dir = Path(sys.argv[1])
+          parser_path = Path(sys.argv[2])
+
+          torrent_dir.mkdir(parents=True, exist_ok=True)
+
+          if not source:
+              print("::error::source 不能为空")
+              raise SystemExit(1)
+
+          # 解包安全限制
+          MAX_DEPTH = 3
+          MAX_MEMBERS = 3000
+          MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+          MAX_TORRENT_BYTES = 200 * 1024 * 1024
+
+          ARCHIVE_KINDS = {"zip", "gzip", "bzip2", "xz", "tar", "7z", "rar"}
+
+
+          def write_output(name, value):
+              output_file = os.environ["GITHUB_OUTPUT"]
+              marker = "EOF_" + base64.b16encode(os.urandom(8)).decode()
+              with open(output_file, "a", encoding="utf-8") as fp:
+                  fp.write(f"{name}<<{marker}\n")
+                  fp.write(str(value))
+                  fp.write("\n")
+                  fp.write(f"{marker}\n")
+
+
+          def is_valid_torrent(path):
+              try:
+                  result = subprocess.run(
+                      [sys.executable, str(parser_path), str(path), "--json"],
+                      capture_output=True, text=True, timeout=60,
+                  )
+                  if result.returncode != 0:
+                      return False, result.stderr.strip()
+                  return True, result.stdout.strip()
+              except Exception as exc:
+                  return False, str(exc)
+
+
+          def quick_torrent_check(path):
+              try:
+                  size = path.stat().st_size
+                  if size < 20 or size > MAX_TORRENT_BYTES:
+                      return False
+                  with open(path, "rb") as fp:
+                      head = fp.read(1)
+                  return head == b"d"
+              except OSError:
+                  return False
+
+
+          def sniff_kind(path):
+              try:
+                  with open(path, "rb") as fp:
+                      head = fp.read(512)
+              except OSError:
+                  return "unknown"
+
+              if not head:
+                  return "empty"
+
+              if head[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
+                  return "zip"
+              if head[:2] == b"\x1f\x8b":
+                  return "gzip"
+              if head[:3] == b"BZh":
+                  return "bzip2"
+              if head[:6] == b"\xfd7zXZ\x00":
+                  return "xz"
+              if head[:6] == b"7z\xbc\xaf\x27\x1c":
+                  return "7z"
+              if head[:6] in (b"Rar!\x1a\x07",) or head[:7] == b"Rar!\x1a\x07\x01":
+                  return "rar"
+              if head[:1] == b"d":
+                  return "maybe-torrent"
+
+              lowered = head[:256].lstrip().lower()
+              if lowered.startswith(b"<!doctype html") or lowered.startswith(b"<html"):
+                  return "html"
+              if lowered.startswith(b"{") or lowered.startswith(b"["):
+                  return "json"
+
+              try:
+                  if tarfile.is_tarfile(str(path)):
+                      return "tar"
+              except Exception:
+                  pass
+
+              return "unknown"
+
+
+          def safe_member_name(name):
+              cleaned = str(name).replace("\\", "/")
+              parts = [p for p in cleaned.split("/") if p not in ("", ".", "..")]
+              if not parts:
+                  return None
+              return "/".join(parts)
+
+
+          def copy_limited(src, dst, budget, chunk=1024 * 1024):
+              written = 0
+              while True:
+                  block = src.read(chunk)
+                  if not block:
+                      break
+                  if budget["left"] - len(block) < 0:
+                      raise RuntimeError("超出解压总量上限")
+                  dst.write(block)
+                  budget["left"] -= len(block)
+                  written += len(block)
+              return written
+
+
+          def extract_zip(path, dest, budget):
+              with zipfile.ZipFile(path) as zf:
+                  count = 0
+                  for info in zf.infolist():
+                      if info.is_dir():
+                          continue
+                      count += 1
+                      if count > MAX_MEMBERS:
+                          print("  已达成员数量上限，停止解包")
+                          break
+                      safe = safe_member_name(info.filename)
+                      if not safe:
+                          continue
+                      target = dest / safe
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with zf.open(info) as src, open(target, "wb") as out:
+                          copy_limited(src, out, budget)
+
+
+          def extract_tar(path, dest, budget):
+              with tarfile.open(str(path), "r:*") as tf:
+                  count = 0
+                  for member in tf:
+                      if not member.isfile():
+                          continue
+                      count += 1
+                      if count > MAX_MEMBERS:
+                          print("  已达成员数量上限，停止解包")
+                          break
+                      safe = safe_member_name(member.name)
+                      if not safe:
+                          continue
+                      src = tf.extractfile(member)
+                      if src is None:
+                          continue
+                      target = dest / safe
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with src, open(target, "wb") as out:
+                          copy_limited(src, out, budget)
+
+
+          def extract_single_stream(path, dest, budget, opener, strip_suffix):
+              name = path.name
+              lowered = name.lower()
+              if lowered.endswith(strip_suffix):
+                  name = name[: -len(strip_suffix)]
+              if not name:
+                  name = "decompressed.bin"
+              target = dest / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              with opener(str(path), "rb") as src, open(target, "wb") as out:
+                  copy_limited(src, out, budget)
+
+
+          def extract_with_7z(path, dest):
+              result = subprocess.run(
+                  ["7z", "x", "-y", "-bd", f"-o{dest}", str(path)],
+                  capture_output=True, text=True, timeout=600,
+              )
+              if result.returncode != 0:
+                  raise RuntimeError(
+                      "7z 解包失败：" + (result.stderr or result.stdout or "")[-500:]
+                  )
+
+
+          def extract_archive(path, kind, dest, budget):
+              if kind == "zip":
+                  extract_zip(path, dest, budget)
+              elif kind == "tar":
+                  extract_tar(path, dest, budget)
+              elif kind == "gzip":
+                  try:
+                      if tarfile.is_tarfile(str(path)):
+                          extract_tar(path, dest, budget)
+                          return
+                  except Exception:
+                      pass
+                  extract_single_stream(path, dest, budget, gzip.open, ".gz")
+              elif kind == "bzip2":
+                  try:
+                      if tarfile.is_tarfile(str(path)):
+                          extract_tar(path, dest, budget)
+                          return
+                  except Exception:
+                      pass
+                  extract_single_stream(path, dest, budget, bz2.open, ".bz2")
+              elif kind == "xz":
+                  try:
+                      if tarfile.is_tarfile(str(path)):
+                          extract_tar(path, dest, budget)
+                          return
+                  except Exception:
+                      pass
+                  extract_single_stream(path, dest, budget, lzma.open, ".xz")
+              elif kind in ("7z", "rar"):
+                  extract_with_7z(path, dest)
+              else:
+                  raise RuntimeError(f"不支持的压缩类型：{kind}")
+
+
+          def harvest_torrents(path, scratch, depth=0, budget=None):
+              if budget is None:
+                  budget = {"left": MAX_TOTAL_BYTES}
+
+              found = []
+
+              if quick_torrent_check(path):
+                  ok, _ = is_valid_torrent(path)
+                  if ok:
+                      return [path]
+
+              if depth >= MAX_DEPTH:
+                  return found
+
+              kind = sniff_kind(path)
+
+              if kind not in ARCHIVE_KINDS:
+                  return found
+
+              print(f"  检测到压缩包（{kind}），尝试解包：{path.name}")
+
+              dest = Path(
+                  tempfile.mkdtemp(prefix=f"unpack{depth}_", dir=str(scratch))
+              )
+
+              try:
+                  extract_archive(path, kind, dest, budget)
+              except Exception as exc:
+                  print(f"  解包失败：{exc}")
+                  return found
+
+              inner = [x for x in dest.rglob("*") if x.is_file()]
+              print(f"  解包得到 {len(inner)} 个文件")
+
+              inner.sort(
+                  key=lambda x: (0 if x.suffix.lower() == ".torrent" else 1, x.name)
+              )
+
+              for item in inner:
+                  found.extend(harvest_torrents(item, scratch, depth + 1, budget))
+
+              return found
+
+
+          def inspect_response(path):
+              print(f"文件路径：{path}")
+              try:
+                  print(f"文件大小：{path.stat().st_size} bytes")
+              except OSError:
+                  return
+              try:
+                  fr = subprocess.run(
+                      ["file", "-b", str(path)],
+                      capture_output=True, text=True, timeout=15,
+                  )
+                  print("file 类型：", fr.stdout.strip())
+              except Exception:
+                  pass
+              try:
+                  print("前 256 字节：", repr(path.read_bytes()[:256]))
+              except Exception:
+                  pass
+
+
+          def candidate_files(root):
+              result = [x for x in root.rglob("*") if x.is_file()]
+              return sorted(result, key=lambda x: x.stat().st_mtime, reverse=True)
+
+
+          # ========================================================
+          # magnet 直接透传
+          # ========================================================
+          if source.startswith("magnet:"):
+              write_output("source_kind", "magnet")
+              write_output("source_value", source)
+              print("检测到 magnet 磁力链接")
+              raise SystemExit(0)
+
+
+          temp_dir = Path(
+              tempfile.mkdtemp(prefix="source_", dir=str(torrent_dir.parent))
+          )
+
+
+          def curl_download(url, out_path, referer=None):
+              cmd = [
+                  "curl",
+                  "--location",
+                  "--fail",
+                  "--show-error",
+                  "--silent",
+                  "--compressed",
+                  "--retry", "3",
+                  "--retry-delay", "2",
+                  "--connect-timeout", "30",
+                  "--max-time", "300",
+                  "--user-agent", "Mozilla/5.0",
+              ]
+              if referer is not None:
+                  cmd += ["-e", referer]
+              cmd += ["--output", str(out_path), url]
+
+              print("执行：", " ".join(shlex.quote(c) for c in cmd))
+              result = subprocess.run(cmd, capture_output=True, timeout=330)
+              stderr = (result.stderr or b"").decode("utf-8", "replace")
+              if stderr.strip():
+                  print(stderr[-1500:])
+              return result.returncode, stderr
+
+
+          def referer_candidates(url, manual):
+              seq = []
+
+              if manual:
+                  seq.append(("手动指定 Referer", manual))
+
+              seq.append(("Referer=;auto", ";auto"))
+
+              parts = urlsplit(url)
+              host = parts.netloc.split(":")[0]
+              origin = urlunsplit((parts.scheme, parts.netloc, "/", "", ""))
+              path = parts.path.rstrip("/")
+              segments = [s for s in path.split("/") if s]
+
+              seq.append(("同源根 Referer", origin))
+
+              if segments:
+                  same_last = urlunsplit(
+                      (parts.scheme, parts.netloc, "/" + segments[-1], "", "")
+                  )
+                  if same_last != url:
+                      seq.append(("同源 + 末段路径 Referer", same_last))
+
+              labels = host.split(".")
+              if len(labels) >= 3 and segments:
+                  apex = ".".join(labels[-2:])
+                  apex_last = urlunsplit(
+                      (parts.scheme, apex, "/" + segments[-1], "", "")
+                  )
+                  seq.append(("主域名 + 末段路径 Referer", apex_last))
+                  seq.append((
+                      "主域名根 Referer",
+                      urlunsplit((parts.scheme, apex, "/", "", "")),
+                  ))
+
+              if "/" in path:
+                  parent = path.rsplit("/", 1)[0] or "/"
+                  parent_url = urlunsplit(
+                      (parts.scheme, parts.netloc, parent, "", "")
+                  )
+                  if parent_url not in (origin, url):
+                      seq.append(("上级路径 Referer", parent_url))
+
+              if len(segments) >= 2:
+                  grand = "/" + "/".join(segments[:-2])
+                  grand_url = urlunsplit(
+                      (parts.scheme, parts.netloc, grand, "", "")
+                  )
+                  if grand_url not in (origin, url):
+                      seq.append(("上上级路径 Referer", grand_url))
+
+              seq.append(("无 Referer", None))
+
+              seen = set()
+              unique = []
+              for label, ref in seq:
+                  key = ("" if ref is None else ref)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  unique.append((label, ref))
+              return unique
+
+
+          collected = []
+
+          try:
+              # ----------------------------------------------------
+              # 直链：多重 Referer 回退 + 压缩包解包
+              # ----------------------------------------------------
+              if source.startswith("http://") or source.startswith("https://"):
+                  print("检测到 HTTP(S) 直链，将按多种 Referer 策略尝试")
+
+                  for label, ref in referer_candidates(source, manual_referer):
+                      tag = base64.b16encode(os.urandom(4)).decode()
+                      attempt_path = temp_dir / f"try_{tag}.bin"
+
+                      print("")
+                      print(f"---- 尝试：{label} ----")
+
+                      rc, err = curl_download(source, attempt_path, referer=ref)
+
+                      if rc != 0:
+                          print(f"该策略下载失败（curl 退出码 {rc}）")
+                          continue
+
+                      if not attempt_path.exists() or attempt_path.stat().st_size < 10:
+                          print("该策略返回内容为空或过小")
+                          continue
+
+                      kind = sniff_kind(attempt_path)
+                      print(f"内容嗅探结果：{kind}")
+
+                      found = harvest_torrents(attempt_path, temp_dir)
+
+                      if found:
+                          print(f"成功：{label} 命中 {len(found)} 个有效 torrent")
+                          collected = found
+                          break
+
+                      print("该策略未得到有效 torrent：")
+                      inspect_response(attempt_path)
+
+              # ----------------------------------------------------
+              # 单条 curl 命令：同样接入解包
+              # ----------------------------------------------------
+              elif source.startswith("curl"):
+                  print("检测到 curl 命令")
+
+                  try:
+                      args = shlex.split(source)
+                  except ValueError as exc:
+                      raise SystemExit(f"curl 命令解析失败：{exc}")
+
+                  if not args or args[0] != "curl":
+                      raise SystemExit("命令必须以 curl 开头")
+
+                  forbidden = {"&&", "||", ";", "|", "`", "$(", ")"}
+                  if any(tok in forbidden for tok in args):
+                      raise SystemExit(
+                          "curl 命令不能包含 &&、||、;、|、`、$( 等 shell 操作符"
+                      )
+
+                  print("实际执行参数：", args)
+
+                  result = subprocess.run(
+                      args, cwd=str(temp_dir), capture_output=True, timeout=330,
+                  )
+                  stdout = result.stdout or b""
+                  stderr = (result.stderr or b"").decode("utf-8", "replace")
+
+                  if stderr.strip():
+                      print("curl stderr：")
+                      print(stderr[-2000:])
+
+                  if result.returncode != 0:
+                      raise SystemExit(f"curl 执行失败，退出码：{result.returncode}")
+
+                  if stdout:
+                      stdout_path = temp_dir / "stdout_response.bin"
+                      try:
+                          stdout_path.write_bytes(stdout)
+                      except Exception:
+                          pass
+
+                  print("")
+                  print("查找并验证 curl 下载结果……")
+
+                  for cand in candidate_files(temp_dir):
+                      print(f"检查：{cand.name}（{sniff_kind(cand)}）")
+                      found = harvest_torrents(cand, temp_dir)
+                      if found:
+                          collected.extend(found)
+
+                  if not collected:
+                      print("::error::curl 未产生有效 torrent")
+                      for cand in candidate_files(temp_dir):
+                          inspect_response(cand)
+
+              else:
+                  raise SystemExit("source 必须是 magnet、HTTP(S) URL 或 curl 命令")
+
+
+              # ----------------------------------------------------
+              # 统一失败提示 / download_all 自动降级
+              # ----------------------------------------------------
+              if not collected:
+                  if run_mode == "download_all" and source.startswith(("http://", "https://")):
+                      print("")
+                      print("::notice::未识别为种子或种子压缩包，将按普通 HTTP 文件直链处理")
+                      write_output("source_kind", "file")
+                      write_output("source_value", source)
+                      raise SystemExit(0)
+
+                  print("")
+                  print("::error::未获取到有效 torrent")
+                  print("已尝试：裸种子校验、压缩包解包（zip/gz/bz2/xz/tar/7z/rar）")
+                  print("常见原因：")
+                  print("1. 服务器返回 HTML 中间页，需要正确 Referer")
+                  print("2. 需要 Cookie 或登录态，请改用带 -b/-H 的 curl 命令")
+                  print("3. 链接已过期或被防盗链拦截")
+                  print("4. 压缩包受密码保护")
+                  print("提示：若这是普通文件直链（非种子），请改用 http_file 模式")
+                  raise SystemExit(1)
+
+
+              # ----------------------------------------------------
+              # 去重 + 排序 + 选择
+              # ----------------------------------------------------
+              unique_map = {}
+              for item in collected:
+                  try:
+                      digest = hashlib.sha1(item.read_bytes()).hexdigest()
+                  except OSError:
+                      continue
+                  unique_map.setdefault(digest, item)
+
+              entries = []
+              for item in unique_map.values():
+                  ok, payload = is_valid_torrent(item)
+                  if not ok:
+                      continue
+                  try:
+                      info = json.loads(payload)
+                  except Exception:
+                      info = {}
+                  entries.append((item, info))
+
+              if not entries:
+                  raise SystemExit("收集到的候选均未通过最终校验")
+
+              entries.sort(key=lambda x: -int(x[1].get("total_size", 0)))
+
+              print("")
+              print("=" * 96)
+              print(f"共获得 {len(entries)} 个有效 torrent：")
+              print("-" * 96)
+              for pos, (item, info) in enumerate(entries, start=1):
+                  print(
+                      f"[{pos}] {info.get('total_size_text', '-'):>12}  "
+                      f"{info.get('file_count', '?')} 个文件  "
+                      f"{info.get('torrent_name', item.name)}"
+                  )
+              print("=" * 96)
+
+              chosen_pos = 0
+              if index_raw:
+                  try:
+                      wanted = int(index_raw)
+                  except ValueError:
+                      raise SystemExit(f"torrent_index 必须是整数：{index_raw}")
+                  if wanted < 1 or wanted > len(entries):
+                      raise SystemExit(
+                          f"torrent_index 超出范围，可用范围 1-{len(entries)}"
+                      )
+                  chosen_pos = wanted - 1
+                  print(f"按 torrent_index 选择第 {wanted} 个")
+              elif len(entries) > 1:
+                  print("未指定 torrent_index，默认选择体积最大的第 1 个")
+                  print("如需其它种子，请重新运行并填写 torrent_index")
+
+              chosen_path, chosen_info = entries[chosen_pos]
+
+              archive_dir = torrent_dir / "candidates"
+              archive_dir.mkdir(parents=True, exist_ok=True)
+              for pos, (item, info) in enumerate(entries, start=1):
+                  shutil.copy2(item, archive_dir / f"{pos:02d}_{item.name}")
+
+              final_path = torrent_dir / "source.torrent"
+              shutil.copy2(chosen_path, final_path)
+
+              ok, _ = is_valid_torrent(final_path)
+              if not ok:
+                  raise SystemExit("统一后的 source.torrent 验证失败")
+
+              write_output("source_kind", "torrent")
+              write_output("source_value", str(final_path))
+
+              print("")
+              print("种子获取并验证成功：")
+              print(f"名称：{chosen_info.get('torrent_name', '-')}")
+              print(f"文件数：{chosen_info.get('file_count', '-')}")
+              print(f"总大小：{chosen_info.get('total_size_text', '-')}")
+              inspect_response(final_path)
+
+          finally:
+              shutil.rmtree(temp_dir, ignore_errors=True)
+          PY
+
+      - name: HTTP 文件直链下载
+        if: ${{ inputs.mode == 'http_file' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "下载模式：普通 HTTP 文件直链"
+          echo "输出目录：$OUTPUT_DIR"
+
+          python3 "$WORK_DIR/http_file_download.py"
+
+      - name: 磁力链接获取 metadata
+        id: metadata
+        if: ${{ steps.source.outputs.source_kind == 'magnet' && (inputs.mode == 'parse' || inputs.mode == 'download_selected') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$META_DIR"
+
+          echo "开始获取磁力 metadata"
+          echo "最长等待：${INPUT_METADATA_TIMEOUT} 秒"
+
+          aria2c \
+            --bt-metadata-only=true \
+            --bt-save-metadata=true \
+            --seed-time=0 \
+            --bt-stop-timeout="$INPUT_METADATA_TIMEOUT" \
+            --timeout=60 \
+            --connect-timeout=30 \
+            --summary-interval=5 \
+            --console-log-level=notice \
+            --dir="$META_DIR" \
+            "${{ steps.source.outputs.source_value }}"
+
+          META_TORRENT="$(
+            python3 - "$META_DIR" <<'PY'
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          candidates = []
+          for item in root.rglob("*"):
+              if not item.is_file():
+                  continue
+              try:
+                  raw = item.read_bytes()
+                  if raw.startswith(b"d") and b"info" in raw:
+                      candidates.append(item)
+              except OSError:
+                  pass
+          if not candidates:
+              raise SystemExit(1)
+          candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+          print(candidates[0])
+          PY
+          )"
+
+          if [[ -z "$META_TORRENT" || ! -f "$META_TORRENT" ]]; then
+            echo "::error::未获取到磁力 metadata。"
+            echo "可能原因：没有可用做种者、metadata 超时、磁力链接无效。"
+            exit 1
+          fi
+
+          cp "$META_TORRENT" "$TORRENT_DIR/metadata.torrent"
+
+          echo "torrent_path=$TORRENT_DIR/metadata.torrent" >> "$GITHUB_OUTPUT"
+
+          echo "metadata 获取成功："
+          ls -lh "$TORRENT_DIR/metadata.torrent"
+
+      - name: 确定解析用 torrent 文件
+        id: torrent
+        if: ${{ inputs.mode == 'parse' || inputs.mode == 'download_selected' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ "${{ steps.source.outputs.source_kind }}" == "torrent" ]]; then
+            TORRENT_PATH="${{ steps.source.outputs.source_value }}"
+          else
+            TORRENT_PATH="${{ steps.metadata.outputs.torrent_path }}"
+          fi
+
+          if [[ -z "$TORRENT_PATH" || ! -f "$TORRENT_PATH" ]]; then
+            echo "::error::解析用 torrent 文件不存在"
+            exit 1
+          fi
+
+          echo "path=$TORRENT_PATH" >> "$GITHUB_OUTPUT"
+          echo "解析文件：$TORRENT_PATH"
+
+      - name: 解析种子并打印文件 ID
+        if: ${{ inputs.mode == 'parse' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "::group::种子文件列表"
+          python3 "$WORK_DIR/torrent_tools.py" \
+            "${{ steps.torrent.outputs.path }}"
+          echo "::endgroup::"
+
+          echo ""
+          echo "解析完成。"
+          echo "请记下文件 ID，然后再次运行工作流："
+          echo "mode: download_selected"
+          echo "file_ids: 例如 1,3,5-8"
+
+      - name: 验证指定文件 ID
+        id: selected
+        if: ${{ inputs.mode == 'download_selected' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          IDS="$INPUT_FILE_IDS"
+
+          if [[ -z "${IDS//[[:space:]]/}" ]]; then
+            echo "::error::download_selected 模式必须填写 file_ids，例如 1,3,5-8"
+            exit 1
+          fi
+
+          export TORRENT_PATH="${{ steps.torrent.outputs.path }}"
+          export IDS_TEXT="$IDS"
+
+          SELECT_CSV="$(
+            python3 - "$WORK_DIR/torrent_tools.py" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          parser = sys.argv[1]
+          torrent_path = os.environ["TORRENT_PATH"]
+          ids_text = os.environ["IDS_TEXT"].strip()
+
+          result = subprocess.run(
+              [sys.executable, parser, torrent_path, "--json"],
+              capture_output=True, text=True, check=True,
+          )
+          data = json.loads(result.stdout)
+          valid_ids = {int(item["id"]) for item in data["files"]}
+
+          selected = set()
+          for token in re.split(r"[\s,]+", ids_text):
+              token = token.strip()
+              if not token:
+                  continue
+              if re.fullmatch(r"\d+", token):
+                  selected.add(int(token))
+                  continue
+              match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", token)
+              if match:
+                  start = int(match.group(1))
+                  end = int(match.group(2))
+                  if end < start:
+                      raise SystemExit(f"无效范围：{token}")
+                  selected.update(range(start, end + 1))
+                  continue
+              raise SystemExit(f"无法识别的文件 ID 格式：{token}")
+
+          invalid = sorted(selected - valid_ids)
+          if invalid:
+              raise SystemExit("以下文件 ID 不存在：" + ",".join(str(x) for x in invalid))
+          if not selected:
+              raise SystemExit("没有选中任何文件")
+
+          print(",".join(str(x) for x in sorted(selected)))
+          PY
+          )"
+
+          echo "select_csv=$SELECT_CSV" >> "$GITHUB_OUTPUT"
+          echo "已验证文件 ID：$SELECT_CSV"
+
+          echo "::group::已选文件详情"
+          python3 - "$WORK_DIR/torrent_tools.py" "$SELECT_CSV" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          parser = sys.argv[1]
+          selected = {int(x) for x in sys.argv[2].split(",")}
+          torrent_path = os.environ["TORRENT_PATH"]
+
+          result = subprocess.run(
+              [sys.executable, parser, torrent_path, "--json"],
+              capture_output=True, text=True, check=True,
+          )
+          data = json.loads(result.stdout)
+          total = 0
+          count = 0
+          for item in data["files"]:
+              if int(item["id"]) in selected:
+                  count += 1
+                  total += int(item["size"])
+                  print(f"[{item['id']}] {item['size_text']:>14}  {item['path']}")
+          print("-" * 100)
+          print(f"选中文件数：{count}")
+          print(f"总大小：{total / 1024 / 1024 / 1024:.2f} GB")
+          PY
+          echo "::endgroup::"
+
+      - name: 下载全部文件
+        if: ${{ inputs.mode == 'download_all' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SOURCE_KIND="${{ steps.source.outputs.source_kind }}"
+          SOURCE_VALUE="${{ steps.source.outputs.source_value }}"
+
+          if [[ "$SOURCE_KIND" == "file" ]]; then
+            echo "下载模式：普通 HTTP 文件直链（由 download_all 自动降级）"
+            echo "输出目录：$OUTPUT_DIR"
+            python3 "$WORK_DIR/http_file_download.py"
+            exit 0
+          fi
+
+          echo "下载模式：全部文件"
+          echo "输出目录：$OUTPUT_DIR"
+
+          aria2c \
+            --dir="$OUTPUT_DIR" \
+            --seed-time="$INPUT_SEED_TIME" \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=4M \
+            --max-concurrent-downloads=5 \
+            --continue=true \
+            --auto-file-renaming=true \
+            --allow-overwrite=false \
+            --file-allocation=none \
+            --disk-cache=64M \
+            --summary-interval=5 \
+            --console-log-level=notice \
+            --bt-max-peers=120 \
+            --bt-request-peer-speed-limit=20M \
+            --bt-stop-timeout=600 \
+            "$SOURCE_VALUE"
+
+      - name: 下载指定文件
+        if: ${{ inputs.mode == 'download_selected' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          TORRENT_PATH="${{ steps.torrent.outputs.path }}"
+          SELECT_CSV="${{ steps.selected.outputs.select_csv }}"
+
+          echo "下载模式：指定文件"
+          echo "指定文件 ID：$SELECT_CSV"
+          echo "输出目录：$OUTPUT_DIR"
+
+          aria2c \
+            --dir="$OUTPUT_DIR" \
+            --seed-time="$INPUT_SEED_TIME" \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=4M \
+            --max-concurrent-downloads=5 \
+            --continue=true \
+            --auto-file-renaming=true \
+            --allow-overwrite=false \
+            --file-allocation=none \
+            --disk-cache=64M \
+            --summary-interval=5 \
+            --console-log-level=notice \
+            --bt-max-peers=120 \
+            --bt-request-peer-speed-limit=20M \
+            --bt-stop-timeout=600 \
+            --select-file="$SELECT_CSV" \
+            --bt-remove-unselected-file=true \
+            "$TORRENT_PATH"
+
+      - name: 输出下载结果
+        if: ${{ success() && (inputs.mode == 'download_all' || inputs.mode == 'download_selected' || inputs.mode == 'http_file') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "==== 下载结果 ===="
+
+          if [[ -z "$(find "$OUTPUT_DIR" -mindepth 1 -print -quit)" ]]; then
+            echo "::warning::下载目录为空"
+          else
+            find "$OUTPUT_DIR" \
+              -maxdepth 6 \
+              -type f \
+              -printf '%s bytes\t%p\n' \
+              | sort -n
+          fi
+
+          echo ""
+          echo "==== 磁盘占用 ===="
+          du -sh "$OUTPUT_DIR" || true
+
+      - name: 上传下载工件
+        if: ${{ success() && (inputs.mode == 'download_all' || inputs.mode == 'download_selected' || inputs.mode == 'http_file') }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: aria2-download-${{ github.run_number }}
+          path: downloads/
+          if-no-files-found: warn
+          compression-level: 0
