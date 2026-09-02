@@ -1,4 +1,4 @@
-name: 🧲 Aria2 Torrent Downloader
+name: 🧲 Aria2 Torrent Downloader-1
 
 on:
   workflow_dispatch:
