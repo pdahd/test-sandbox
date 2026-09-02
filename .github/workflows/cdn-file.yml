@@ -1,340 +1,581 @@
-name: 🌩️ CDN 限速文件下载器（Bunkr 类）
+name: 🪣 Bunkr CDN 分块下载器
 
 on:
   workflow_dispatch:
     inputs:
-      url:
-        description: 必填：CDN 直链（如 https://c3pz-b.cdn.cr/storage/media/xxx.mp4?token=...&ex=...）
+      source:
+        description: >-
+          必填。支持三种形式：
+          ① 文件页 https://dl.bunkr.cr/file/19535114
+          ② 纯文件 ID 19535114
+          ③ 完整 CDN 直链（含 token 与 ex）
         required: true
         type: string
 
-      referer:
-        description: >-
-          Referer。Bunkr 类必须填站点域名（不是 CDN 域名）。
-          常见：https://bunkr.ph/  https://bunkr.ru/  https://bunkr.si/  https://bunkr.cr/
+      site:
+        description: 站点域名，用于 API 与 Referer。默认 https://dl.bunkr.cr
         required: false
-        default: "https://bunkr.ph/"
+        default: "https://dl.bunkr.cr"
+        type: string
+
+      chunk_mb:
+        description: 每次 Range 请求的分块大小（MB）。边缘缓存块是 4MB，建议 4 / 8 / 16
+        required: false
+        default: "8"
+        type: string
+
+      chunk_delay:
+        description: 分块之间的基础间隔秒数。频繁 429 时调大到 2 ~ 5
+        required: false
+        default: "0.6"
+        type: string
+
+      max_stall:
+        description: 同一偏移量连续失败多少次后放弃
+        required: false
+        default: "25"
+        type: string
+
+      resign_minutes:
+        description: 每隔多少分钟主动重签一次 token
+        required: false
+        default: "12"
         type: string
 
       filename:
-        description: 可选：自定义保存文件名。留空则自动从 URL / 响应头推断
+        description: 可选。自定义保存文件名，留空自动推断
         required: false
         default: ""
-        type: string
-
-      max_rounds:
-        description: 断点续传最大轮数（每轮被掐断后自动续传）
-        required: false
-        default: "400"
-        type: string
-
-      per_round_wait:
-        description: 每轮续传之间的等待秒数（太快会再次触发 429）
-        required: false
-        default: "8"
         type: string
 
 permissions:
   contents: read
 
 jobs:
-  cdn:
-    name: CDN 限速下载
+  download:
+    name: Bunkr 分块下载
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
     env:
-      INPUT_URL: ${{ inputs.url }}
-      INPUT_REFERER: ${{ inputs.referer }}
-      INPUT_FILENAME: ${{ inputs.filename }}
-      INPUT_MAX_ROUNDS: ${{ inputs.max_rounds }}
-      INPUT_PER_ROUND_WAIT: ${{ inputs.per_round_wait }}
-      OUTPUT_DIR: ${{ github.workspace }}/downloads
-      # 与 HAR 中一致的真实浏览器 UA
-      UA: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+      IN_SOURCE: ${{ inputs.source }}
+      IN_SITE: ${{ inputs.site }}
+      IN_CHUNK_MB: ${{ inputs.chunk_mb }}
+      IN_CHUNK_DELAY: ${{ inputs.chunk_delay }}
+      IN_MAX_STALL: ${{ inputs.max_stall }}
+      IN_RESIGN_MIN: ${{ inputs.resign_minutes }}
+      IN_FILENAME: ${{ inputs.filename }}
+      OUT_DIR: ${{ github.workspace }}/downloads
 
     steps:
-      - name: 安装 aria2 与 curl
+      - name: 准备环境
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 curl coreutils
-          aria2c --version | head -n 1
-          curl --version | head -n 1
+          mkdir -p "$OUT_DIR"
+          python3 -m pip install --quiet --upgrade requests
+          python3 -c "import requests; print('requests', requests.__version__)"
 
-      - name: 创建输出目录
+      - name: 分块续传下载
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "$OUTPUT_DIR"
+          python3 <<'PYEOF'
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.parse
+          from pathlib import Path
 
-      - name: 推断文件名与预期大小
-        id: probe
-        shell: bash
-        run: |
-          set -Eeuo pipefail
+          import requests
+          from requests.adapters import HTTPAdapter
 
-          export INPUT_URL INPUT_FILENAME INPUT_REFERER UA
 
-          python3 <<'PY'
-          import os, re, subprocess
-          from urllib.parse import urlsplit, parse_qs, unquote
+          # ============================================================
+          # 参数
+          # ============================================================
+          SOURCE = os.environ.get("IN_SOURCE", "").strip()
+          SITE = (os.environ.get("IN_SITE") or "https://dl.bunkr.cr").strip().rstrip("/")
+          CHUNK_MB = float(os.environ.get("IN_CHUNK_MB") or "8")
+          CHUNK_DELAY = float(os.environ.get("IN_CHUNK_DELAY") or "0.6")
+          MAX_STALL = int(os.environ.get("IN_MAX_STALL") or "25")
+          RESIGN_SEC = float(os.environ.get("IN_RESIGN_MIN") or "12") * 60
+          FILENAME_OVERRIDE = os.environ.get("IN_FILENAME", "").strip()
+          OUT_DIR = Path(os.environ["OUT_DIR"])
 
-          url = os.environ["INPUT_URL"].strip()
-          referer = os.environ["INPUT_REFERER"].strip()
-          ua = os.environ["UA"]
-          manual = os.environ.get("INPUT_FILENAME", "").strip()
+          CHUNK = int(CHUNK_MB * 1024 * 1024)
+          SIGN_API = "https://glb-apisign.cdn.cr/sign"
 
-          def out(k, v):
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-                  f.write(f"{k}={v}\n")
-
-          # 1) HEAD 探测，拿 Content-Length 与 Content-Disposition
-          expected = ""
-          cd_name = ""
-          try:
-              cmd = ["curl", "-sIL", "--max-time", "60", "-A", ua]
-              if referer:
-                  cmd += ["-e", referer]
-              cmd.append(url)
-              r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-              headers = r.stdout
-              for line in headers.splitlines():
-                  low = line.lower()
-                  if low.startswith("content-length:"):
-                      digits = re.sub(r"[^0-9]", "", line.split(":", 1)[1])
-                      if digits:
-                          expected = digits  # 取最后一个
-                  m = re.search(r"filename\*=UTF-8''([^;\r\n]+)", line, re.I)
-                  if m:
-                      cd_name = unquote(m.group(1).strip().strip('"'))
-                  else:
-                      m2 = re.search(r'filename="?([^";\r\n]+)"?', line, re.I)
-                      if m2 and not cd_name:
-                          cd_name = m2.group(1).strip()
-              print("HEAD 响应头（节选）：")
-              for line in headers.splitlines():
-                  low = line.lower()
-                  if line.startswith("HTTP/") or low.startswith(
-                      ("content-length:", "content-type:", "content-disposition:",
-                       "accept-ranges:", "location:")):
-                      print("  " + line.strip())
-          except Exception as e:
-              print("HEAD 探测失败（不影响下载）：", e)
-
-          # 2) 文件名优先级：手动 > URL 的 n= 参数 > URL 路径 > Content-Disposition
-          name = ""
-          if manual:
-              name = manual
-          if not name:
-              q = parse_qs(urlsplit(url).query)
-              if "n" in q and q["n"]:
-                  name = unquote(q["n"][0])
-          if not name:
-              base = urlsplit(url).path.rsplit("/", 1)[-1]
-              if base:
-                  name = unquote(base)
-          if not name and cd_name:
-              name = cd_name
-          if not name:
-              name = "download.bin"
-
-          # 清理非法字符
-          name = re.sub(r'[\\/:*?"<>|]', "_", name).strip() or "download.bin"
-
-          print("最终文件名：", name)
-          print("预期大小：", expected or "未知")
-          out("filename", name)
-          out("expected", expected)
-          PY
-
-      - name: 单连接反复续传下载
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          URL="$INPUT_URL"
-          REFERER="$INPUT_REFERER"
-          NAME="${{ steps.probe.outputs.filename }}"
-          EXPECTED="${{ steps.probe.outputs.expected }}"
-          MAX_ROUNDS="${INPUT_MAX_ROUNDS:-400}"
-          WAIT="${INPUT_PER_ROUND_WAIT:-8}"
-          OUT="$OUTPUT_DIR/$NAME"
-
-          echo "URL      : $URL"
-          echo "Referer  : ${REFERER:-<空>}"
-          echo "文件名   : $NAME"
-          echo "预期大小 : ${EXPECTED:-未知}"
-          echo "输出路径 : $OUT"
-          echo "最大轮数 : $MAX_ROUNDS   每轮间隔: ${WAIT}s"
-          echo "策略：单连接（避免 429）+ --continue 反复续传（对抗 bunkr 掐断）"
-
-          # 组装 aria2 公共参数（单连接是关键）
-          ARIA_ARGS=(
-            "--dir=$OUTPUT_DIR"
-            "--out=$NAME"
-            "--continue=true"
-            "--max-connection-per-server=1"
-            "--split=1"
-            "--max-tries=5"
-            "--retry-wait=10"
-            "--timeout=60"
-            "--connect-timeout=30"
-            "--lowest-speed-limit=1K"
-            "--allow-overwrite=false"
-            "--auto-file-renaming=false"
-            "--file-allocation=none"
-            "--http-accept-gzip=false"
-            "--summary-interval=10"
-            "--console-log-level=warn"
-            "--user-agent=$UA"
+          UA = (
+              "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
           )
-          if [ -n "$REFERER" ]; then
-            ARIA_ARGS+=("--referer=$REFERER")
-          fi
 
-          cur_size() { stat -c%s "$OUT" 2>/dev/null || echo 0; }
+          if not SOURCE:
+              print("::error::source 不能为空")
+              raise SystemExit(1)
 
-          prev=0
-          stall=0
-          done=0
+          OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-          for round in $(seq 1 "$MAX_ROUNDS"); do
-            echo ""
-            echo "==== 第 $round / $MAX_ROUNDS 轮（aria2c 单连接续传） ===="
 
-            # aria2 被掐断会返回非 0，用 || true 让循环继续
-            aria2c "${ARIA_ARGS[@]}" "$URL" || true
+          def human(n):
+              n = float(n)
+              for unit in ("B", "KB", "MB", "GB", "TB"):
+                  if n < 1024 or unit == "TB":
+                      return f"{n:.0f} {unit}" if unit == "B" else f"{n:.2f} {unit}"
+                  n /= 1024
+              return f"{n:.2f} TB"
 
-            cur="$(cur_size)"
-            echo "本轮结束：已下载 ${cur} bytes / 预期 ${EXPECTED:-未知}"
 
-            if [ -n "$EXPECTED" ] && [ "$cur" -ge "$EXPECTED" ]; then
-              done=1
-              echo "✅ 已达到预期大小，下载完成"
-              break
-            fi
+          def safe_name(name):
+              name = urllib.parse.unquote(name or "")
+              name = re.sub(r'[\\/:*?"<>|]', "_", name).strip()
+              return name or "download.bin"
 
-            # 预期未知时，若 aria2 已把 .aria2 控制文件删除，视为完成
-            if [ -z "$EXPECTED" ] && [ ! -f "$OUT.aria2" ] && [ "$cur" -gt 0 ]; then
-              done=1
-              echo "✅ aria2 报告完成（无 .aria2 控制文件）"
-              break
-            fi
 
-            # 停滞检测：连续多轮无进展则尝试 curl 兜底
-            if [ "$cur" -le "$prev" ]; then
-              stall=$((stall + 1))
-            else
-              stall=0
-            fi
-            prev="$cur"
+          # ============================================================
+          # HTTP 会话：复用 TCP 连接，减少握手开销与被限流概率
+          # ============================================================
+          session = requests.Session()
+          session.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=4))
 
-            if [ "$stall" -ge 6 ]; then
-              echo "⚠️ 连续 $stall 轮无进展，切换 curl -C - 兜底续传"
-              break
-            fi
+          BASE_HEADERS = {
+              "User-Agent": UA,
+              "Accept-Language": "zh-CN,zh;q=0.9",
+              "Connection": "keep-alive",
+              "sec-ch-ua": '"Chromium";v="139", "Not;A=Brand";v="99"',
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": '"Android"',
+          }
 
-            sleep "$WAIT"
-          done
 
-          # ---------- curl 兜底：aria2 停滞时用 curl 断点续传继续 ----------
-          if [ "$done" -ne 1 ]; then
-            echo ""
-            echo "==== curl 兜底续传阶段 ===="
-            # 移除 aria2 控制文件，避免干扰 curl 的 -C -
-            rm -f "$OUT.aria2" || true
+          # ============================================================
+          # 第一步：解析 source，得到 cdn_host / path / filename
+          # ============================================================
+          def call_file_api(file_id):
+              """POST /api/_001_v2 拿 mediafiles、original、path"""
+              url = f"{SITE}/api/_001_v2"
+              headers = dict(BASE_HEADERS)
+              headers.update({
+                  "Accept": "*/*",
+                  "Content-Type": "application/json",
+                  "Origin": SITE,
+                  "Referer": f"{SITE}/file/{file_id}",
+                  "Cache-Control": "no-cache",
+                  "Pragma": "no-cache",
+                  "Sec-Fetch-Dest": "empty",
+                  "Sec-Fetch-Mode": "cors",
+                  "Sec-Fetch-Site": "same-origin",
+              })
 
-            prev="$(cur_size)"
-            stall=0
-            for cround in $(seq 1 "$MAX_ROUNDS"); do
-              echo ""
-              echo "---- curl 第 $cround 轮续传 ----"
-
-              CURL_ARGS=(
-                --location
-                --fail
-                --show-error
-                --continue-at -
-                --retry 5
-                --retry-delay 10
-                --connect-timeout 30
-                --speed-limit 1024
-                --speed-time 60
-                -A "$UA"
-                -o "$OUT"
+              print(f"调用文件 API：POST {url}  id={file_id}")
+              resp = session.post(
+                  url,
+                  headers=headers,
+                  data=json.dumps({"id": str(file_id)}),
+                  timeout=60,
               )
-              if [ -n "$REFERER" ]; then
-                CURL_ARGS+=(-e "$REFERER")
-              fi
+              print(f"  HTTP {resp.status_code}")
 
-              curl "${CURL_ARGS[@]}" "$URL" || true
+              if resp.status_code != 200:
+                  snippet = resp.text[:300].replace("\n", " ")
+                  raise RuntimeError(f"文件 API 返回 {resp.status_code}：{snippet}")
 
-              cur="$(cur_size)"
-              echo "本轮结束：已下载 ${cur} bytes / 预期 ${EXPECTED:-未知}"
+              data = resp.json()
+              print(f"  mediafiles = {data.get('mediafiles')}")
+              print(f"  original   = {data.get('original')}")
+              print(f"  path       = {data.get('path')}")
+              return data
 
-              if [ -n "$EXPECTED" ] && [ "$cur" -ge "$EXPECTED" ]; then
-                done=1
-                echo "✅ 已达到预期大小，下载完成"
-                break
-              fi
 
-              if [ "$cur" -le "$prev" ]; then
-                stall=$((stall + 1))
-              else
-                stall=0
-              fi
-              prev="$cur"
+          def resolve_source():
+              """
+              返回 (cdn_host, media_path, filename, file_id)
+              file_id 可能为 None（直链输入时）
+              """
+              # 形式 ③：完整 CDN 直链
+              if SOURCE.startswith(("http://", "https://")) and "/file/" not in SOURCE:
+                  parts = urllib.parse.urlsplit(SOURCE)
+                  qs = urllib.parse.parse_qs(parts.query)
 
-              if [ "$stall" -ge 8 ]; then
-                echo "⚠️ curl 连续 $stall 轮无进展，放弃"
-                break
-              fi
+                  cdn_host = f"{parts.scheme}://{parts.netloc}"
+                  media_path = parts.path
+                  name = qs.get("n", [""])[0] or Path(parts.path).name
 
-              sleep "$WAIT"
-            done
-          fi
+                  print("输入识别为：CDN 直链")
+                  print(f"  CDN 主机 = {cdn_host}")
+                  print(f"  资源路径 = {media_path}")
+                  return cdn_host, media_path, safe_name(name), None
 
-          echo ""
-          echo "==== 结果 ===="
-          ls -lh "$OUT" 2>/dev/null || echo "输出文件不存在"
-          final="$(cur_size)"
-          echo "最终大小：$final bytes"
+              # 形式 ①：文件页 URL
+              file_id = None
+              if SOURCE.startswith(("http://", "https://")):
+                  match = re.search(r"/file/([A-Za-z0-9_-]+)", SOURCE)
+                  if not match:
+                      raise RuntimeError("无法从页面地址中解析文件 ID")
+                  file_id = match.group(1)
+                  print(f"输入识别为：文件页，ID = {file_id}")
 
-          if [ -n "$EXPECTED" ]; then
-            if [ "$final" -ge "$EXPECTED" ]; then
-              echo "✅ 完整下载：$final / $EXPECTED"
-            else
-              pct=$(awk "BEGIN{printf \"%.1f\", $final*100/$EXPECTED}")
-              echo "::error::下载不完整：$final / $EXPECTED（$pct%）"
-              echo "可能原因：token 已过期(ex=...)、Referer 不匹配、或 bunkr 掐断过于频繁。"
-              echo "建议：换更快的 bunkr 镜像域名、确认 Referer、或缩短 per_round_wait 后重试。"
-              exit 1
-            fi
-          else
-            if [ "$final" -le 0 ]; then
-              echo "::error::未下载到任何数据"
-              exit 1
-            fi
-            echo "⚠️ 预期大小未知，已下载 $final bytes，请自行确认是否完整"
-          fi
+              # 形式 ②：纯 ID
+              else:
+                  if not re.fullmatch(r"[A-Za-z0-9_-]+", SOURCE):
+                      raise RuntimeError("source 既不是合法 URL，也不是合法文件 ID")
+                  file_id = SOURCE
+                  print(f"输入识别为：文件 ID = {file_id}")
 
-      - name: 列出下载结果
+              info = call_file_api(file_id)
+
+              cdn_host = (info.get("mediafiles") or "").rstrip("/")
+              media_path = info.get("path") or ""
+              name = info.get("original") or Path(media_path).name
+
+              if not cdn_host or not media_path:
+                  raise RuntimeError(f"文件 API 返回内容不完整：{info}")
+
+              return cdn_host, media_path, safe_name(name), file_id
+
+
+          # ============================================================
+          # 第二步：签名，随时可重新调用换新 token
+          # ============================================================
+          def sign_path(media_path):
+              headers = dict(BASE_HEADERS)
+              headers.update({
+                  "Accept": "*/*",
+                  "Origin": SITE,
+                  "Referer": f"{SITE}/",
+                  "Cache-Control": "no-cache",
+                  "Pragma": "no-cache",
+                  "Sec-Fetch-Dest": "empty",
+                  "Sec-Fetch-Mode": "cors",
+                  "Sec-Fetch-Site": "cross-site",
+              })
+
+              params = {"path": media_path}
+              resp = session.get(SIGN_API, params=params, headers=headers, timeout=60)
+
+              if resp.status_code != 200:
+                  snippet = resp.text[:200].replace("\n", " ")
+                  raise RuntimeError(f"签名接口返回 {resp.status_code}：{snippet}")
+
+              data = resp.json()
+              token = data.get("token")
+              expire = data.get("ex")
+
+              if not token or not expire:
+                  raise RuntimeError(f"签名返回内容异常：{data}")
+
+              left = int(expire) - int(time.time())
+              print(f"  新 token = {token[:16]}...  ex = {expire}  剩余约 {left // 60} 分钟")
+              return token, int(expire)
+
+
+          def build_url(cdn_host, media_path, filename, token, expire):
+              query = urllib.parse.urlencode({
+                  "n": filename,
+                  "token": token,
+                  "ex": expire,
+              })
+              return f"{cdn_host}{media_path}?{query}"
+
+
+          # ============================================================
+          # 第三步：探测总大小
+          # ============================================================
+          def probe_total(url):
+              headers = dict(BASE_HEADERS)
+              headers.update({
+                  "Accept": "*/*",
+                  "Accept-Encoding": "identity",
+                  "Referer": f"{SITE}/",
+                  "Range": "bytes=0-0",
+              })
+
+              resp = session.get(url, headers=headers, timeout=60, stream=True)
+              status = resp.status_code
+              crange = resp.headers.get("Content-Range", "")
+              clen = resp.headers.get("Content-Length", "")
+              cdisp = resp.headers.get("Content-Disposition", "")
+              resp.close()
+
+              print(f"探测：HTTP {status}")
+              print(f"  Content-Range  = {crange}")
+              print(f"  Content-Length = {clen}")
+              print(f"  X-Cache-Range  = {resp.headers.get('X-Cache-Range')}")
+
+              total = None
+              match = re.search(r"/(\d+)\s*$", crange)
+              if match:
+                  total = int(match.group(1))
+              elif status == 200 and clen.isdigit():
+                  total = int(clen)
+
+              cd_name = ""
+              match = re.search(r"filename\*=UTF-8''([^;]+)", cdisp, re.I)
+              if match:
+                  cd_name = urllib.parse.unquote(match.group(1)).strip('"')
+              else:
+                  match = re.search(r'filename="([^"]+)"', cdisp, re.I)
+                  if match:
+                      cd_name = match.group(1)
+
+              return status, total, cd_name
+
+
+          # ============================================================
+          # 主流程
+          # ============================================================
+          print("=" * 78)
+          print("Bunkr CDN 分块下载器")
+          print("=" * 78)
+          print(f"站点     : {SITE}")
+          print(f"分块大小 : {human(CHUNK)}")
+          print(f"基础间隔 : {CHUNK_DELAY}s")
+          print("")
+
+          cdn_host, media_path, filename, file_id = resolve_source()
+
+          if FILENAME_OVERRIDE:
+              filename = safe_name(FILENAME_OVERRIDE)
+
+          print("")
+          print("首次签名：")
+          token, expire = sign_path(media_path)
+          signed_at = time.time()
+
+          url = build_url(cdn_host, media_path, filename, token, expire)
+
+          print("")
+          status, total, cd_name = probe_total(url)
+
+          if status in (401, 403):
+              print("首次探测被拒，立即重签一次")
+              token, expire = sign_path(media_path)
+              signed_at = time.time()
+              url = build_url(cdn_host, media_path, filename, token, expire)
+              status, total, cd_name = probe_total(url)
+
+          if cd_name and not FILENAME_OVERRIDE:
+              filename = safe_name(cd_name)
+              url = build_url(cdn_host, media_path, filename, token, expire)
+
+          dest = OUT_DIR / filename
+
+          print("")
+          print(f"保存文件 : {dest}")
+          print(f"总大小   : {human(total) if total else '未知'}")
+          print("")
+
+          if not total:
+              print("::error::无法确定文件总大小，服务器可能未返回 Content-Range")
+              raise SystemExit(1)
+
+
+          # ------------------------------------------------------------
+          # 分块循环
+          # ------------------------------------------------------------
+          downloaded = dest.stat().st_size if dest.exists() else 0
+
+          if downloaded > total:
+              print(f"本地文件比预期大，重新开始（{downloaded} > {total}）")
+              dest.unlink()
+              downloaded = 0
+
+          if downloaded:
+              print(f"检测到已有进度：{human(downloaded)}，从断点继续")
+
+          stall = 0
+          delay = CHUNK_DELAY
+          consecutive_429 = 0
+          round_no = 0
+          started = time.time()
+          last_report = time.time()
+          last_bytes = downloaded
+
+          file_handle = open(dest, "ab")
+
+          try:
+              while downloaded < total:
+                  round_no += 1
+
+                  # token 到期前主动重签
+                  need_resign = (
+                      time.time() - signed_at > RESIGN_SEC
+                      or expire - int(time.time()) < 300
+                  )
+                  if need_resign:
+                      print(f"[{round_no}] token 需要刷新")
+                      try:
+                          token, expire = sign_path(media_path)
+                          signed_at = time.time()
+                          url = build_url(cdn_host, media_path, filename, token, expire)
+                      except Exception as exc:
+                          print(f"  重签失败：{exc}，稍后重试")
+                          time.sleep(10)
+                          continue
+
+                  start = downloaded
+                  end = min(start + CHUNK - 1, total - 1)
+
+                  headers = dict(BASE_HEADERS)
+                  headers.update({
+                      "Accept": "*/*",
+                      "Accept-Encoding": "identity",
+                      "Referer": f"{SITE}/",
+                      "Range": f"bytes={start}-{end}",
+                      "Cache-Control": "no-cache",
+                      "Pragma": "no-cache",
+                  })
+
+                  try:
+                      resp = session.get(url, headers=headers, timeout=(30, 120), stream=True)
+                      code = resp.status_code
+
+                      # ---- 限流 ----
+                      if code == 429:
+                          resp.close()
+                          consecutive_429 += 1
+                          stall += 1
+                          wait = min(5 * (2 ** min(consecutive_429, 5)), 180)
+                          delay = min(delay * 1.5, 8.0)
+                          print(
+                              f"[{round_no}] 429 限流（连续 {consecutive_429} 次），"
+                              f"等待 {wait:.0f}s，间隔调整为 {delay:.1f}s"
+                          )
+                          time.sleep(wait)
+                          continue
+
+                      # ---- token 失效 ----
+                      if code in (401, 403):
+                          resp.close()
+                          stall += 1
+                          print(f"[{round_no}] HTTP {code}，token 可能失效，立即重签")
+                          try:
+                              token, expire = sign_path(media_path)
+                              signed_at = time.time()
+                              url = build_url(cdn_host, media_path, filename, token, expire)
+                          except Exception as exc:
+                              print(f"  重签失败：{exc}")
+                              time.sleep(15)
+                          continue
+
+                      # ---- 范围越界，视为已完成 ----
+                      if code == 416:
+                          resp.close()
+                          print(f"[{round_no}] 416，认为已下载完毕")
+                          break
+
+                      # ---- 服务器忽略 Range ----
+                      if code == 200 and start > 0:
+                          resp.close()
+                          stall += 1
+                          print(f"[{round_no}] 服务器忽略 Range 返回 200，跳过本轮避免覆盖")
+                          time.sleep(5)
+                          continue
+
+                      if code not in (200, 206):
+                          resp.close()
+                          stall += 1
+                          print(f"[{round_no}] 异常状态 {code}")
+                          time.sleep(5)
+                          continue
+
+                      # ---- 正常接收 ----
+                      got = 0
+                      for block in resp.iter_content(chunk_size=65536):
+                          if block:
+                              file_handle.write(block)
+                              got += len(block)
+                      resp.close()
+
+                      if got == 0:
+                          stall += 1
+                          print(f"[{round_no}] 本轮 0 字节")
+                          time.sleep(5)
+                          continue
+
+                      file_handle.flush()
+                      downloaded += got
+                      stall = 0
+                      consecutive_429 = 0
+                      delay = max(CHUNK_DELAY, delay * 0.9)
+
+                      now = time.time()
+                      if now - last_report >= 5 or downloaded >= total:
+                          speed = (downloaded - last_bytes) / max(now - last_report, 0.001)
+                          pct = downloaded * 100.0 / total
+                          eta = (total - downloaded) / speed if speed > 1 else 0
+                          print(
+                              f"  {human(downloaded)} / {human(total)}  "
+                              f"{pct:5.1f}%  {human(speed)}/s  "
+                              f"剩余约 {int(eta // 60)}m{int(eta % 60):02d}s"
+                          )
+                          last_report = now
+                          last_bytes = downloaded
+
+                  except requests.exceptions.RequestException as exc:
+                      stall += 1
+                      print(f"[{round_no}] 网络异常：{type(exc).__name__}: {exc}")
+                      time.sleep(min(5 + stall * 2, 60))
+                      continue
+
+                  # ---- 卡死保护 ----
+                  if stall >= MAX_STALL:
+                      print("")
+                      print(f"::error::同一位置连续失败 {stall} 次，终止")
+                      print(f"当前进度 {human(downloaded)} / {human(total)}")
+                      break
+
+                  if downloaded < total:
+                      time.sleep(delay)
+
+          finally:
+              file_handle.close()
+
+
+          # ------------------------------------------------------------
+          # 校验
+          # ------------------------------------------------------------
+          final = dest.stat().st_size if dest.exists() else 0
+          elapsed = time.time() - started
+
+          print("")
+          print("=" * 78)
+          print(f"文件     : {dest}")
+          print(f"最终大小 : {final} bytes（{human(final)}）")
+          print(f"预期大小 : {total} bytes（{human(total)}）")
+          print(f"耗时     : {int(elapsed // 60)}m{int(elapsed % 60):02d}s")
+          print(f"总轮数   : {round_no}")
+          print("=" * 78)
+
+          if final != total:
+              pct = final * 100.0 / total
+              print(f"::error::下载不完整，仅 {pct:.1f}%")
+              print("建议：")
+              print("  1. chunk_delay 调大到 2 ~ 5")
+              print("  2. chunk_mb 调小到 4")
+              print("  3. 重新运行，脚本会自动从断点继续")
+              raise SystemExit(1)
+
+          print("下载完成")
+          PYEOF
+
+      - name: 列出结果
         if: ${{ always() }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          echo "==== downloads 目录 ===="
-          find "$OUTPUT_DIR" -maxdepth 2 -type f -printf '%s bytes\t%p\n' 2>/dev/null | sort -n || true
-          echo "==== 占用 ===="
-          du -sh "$OUTPUT_DIR" 2>/dev/null || true
+          echo "==== downloads ===="
+          find "$OUT_DIR" -type f -printf '%s bytes\t%p\n' 2>/dev/null | sort -n || true
+          du -sh "$OUT_DIR" 2>/dev/null || true
 
       - name: 上传工件
         if: ${{ success() }}
         uses: actions/upload-artifact@v6
         with:
-          name: cdn-download-${{ github.run_number }}
+          name: bunkr-${{ github.run_number }}
           path: downloads/
-          if-no-files-found: warn
+          if-no-files-found: error
           compression-level: 0
