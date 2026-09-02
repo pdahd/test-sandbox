@@ -1,0 +1,340 @@
+name: 🌩️ CDN 限速文件下载器（Bunkr 类）
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 必填：CDN 直链（如 https://c3pz-b.cdn.cr/storage/media/xxx.mp4?token=...&ex=...）
+        required: true
+        type: string
+
+      referer:
+        description: >-
+          Referer。Bunkr 类必须填站点域名（不是 CDN 域名）。
+          常见：https://bunkr.ph/  https://bunkr.ru/  https://bunkr.si/  https://bunkr.cr/
+        required: false
+        default: "https://bunkr.ph/"
+        type: string
+
+      filename:
+        description: 可选：自定义保存文件名。留空则自动从 URL / 响应头推断
+        required: false
+        default: ""
+        type: string
+
+      max_rounds:
+        description: 断点续传最大轮数（每轮被掐断后自动续传）
+        required: false
+        default: "400"
+        type: string
+
+      per_round_wait:
+        description: 每轮续传之间的等待秒数（太快会再次触发 429）
+        required: false
+        default: "8"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  cdn:
+    name: CDN 限速下载
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      INPUT_URL: ${{ inputs.url }}
+      INPUT_REFERER: ${{ inputs.referer }}
+      INPUT_FILENAME: ${{ inputs.filename }}
+      INPUT_MAX_ROUNDS: ${{ inputs.max_rounds }}
+      INPUT_PER_ROUND_WAIT: ${{ inputs.per_round_wait }}
+      OUTPUT_DIR: ${{ github.workspace }}/downloads
+      # 与 HAR 中一致的真实浏览器 UA
+      UA: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+
+    steps:
+      - name: 安装 aria2 与 curl
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl coreutils
+          aria2c --version | head -n 1
+          curl --version | head -n 1
+
+      - name: 创建输出目录
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$OUTPUT_DIR"
+
+      - name: 推断文件名与预期大小
+        id: probe
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          export INPUT_URL INPUT_FILENAME INPUT_REFERER UA
+
+          python3 <<'PY'
+          import os, re, subprocess
+          from urllib.parse import urlsplit, parse_qs, unquote
+
+          url = os.environ["INPUT_URL"].strip()
+          referer = os.environ["INPUT_REFERER"].strip()
+          ua = os.environ["UA"]
+          manual = os.environ.get("INPUT_FILENAME", "").strip()
+
+          def out(k, v):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write(f"{k}={v}\n")
+
+          # 1) HEAD 探测，拿 Content-Length 与 Content-Disposition
+          expected = ""
+          cd_name = ""
+          try:
+              cmd = ["curl", "-sIL", "--max-time", "60", "-A", ua]
+              if referer:
+                  cmd += ["-e", referer]
+              cmd.append(url)
+              r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+              headers = r.stdout
+              for line in headers.splitlines():
+                  low = line.lower()
+                  if low.startswith("content-length:"):
+                      digits = re.sub(r"[^0-9]", "", line.split(":", 1)[1])
+                      if digits:
+                          expected = digits  # 取最后一个
+                  m = re.search(r"filename\*=UTF-8''([^;\r\n]+)", line, re.I)
+                  if m:
+                      cd_name = unquote(m.group(1).strip().strip('"'))
+                  else:
+                      m2 = re.search(r'filename="?([^";\r\n]+)"?', line, re.I)
+                      if m2 and not cd_name:
+                          cd_name = m2.group(1).strip()
+              print("HEAD 响应头（节选）：")
+              for line in headers.splitlines():
+                  low = line.lower()
+                  if line.startswith("HTTP/") or low.startswith(
+                      ("content-length:", "content-type:", "content-disposition:",
+                       "accept-ranges:", "location:")):
+                      print("  " + line.strip())
+          except Exception as e:
+              print("HEAD 探测失败（不影响下载）：", e)
+
+          # 2) 文件名优先级：手动 > URL 的 n= 参数 > URL 路径 > Content-Disposition
+          name = ""
+          if manual:
+              name = manual
+          if not name:
+              q = parse_qs(urlsplit(url).query)
+              if "n" in q and q["n"]:
+                  name = unquote(q["n"][0])
+          if not name:
+              base = urlsplit(url).path.rsplit("/", 1)[-1]
+              if base:
+                  name = unquote(base)
+          if not name and cd_name:
+              name = cd_name
+          if not name:
+              name = "download.bin"
+
+          # 清理非法字符
+          name = re.sub(r'[\\/:*?"<>|]', "_", name).strip() or "download.bin"
+
+          print("最终文件名：", name)
+          print("预期大小：", expected or "未知")
+          out("filename", name)
+          out("expected", expected)
+          PY
+
+      - name: 单连接反复续传下载
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          URL="$INPUT_URL"
+          REFERER="$INPUT_REFERER"
+          NAME="${{ steps.probe.outputs.filename }}"
+          EXPECTED="${{ steps.probe.outputs.expected }}"
+          MAX_ROUNDS="${INPUT_MAX_ROUNDS:-400}"
+          WAIT="${INPUT_PER_ROUND_WAIT:-8}"
+          OUT="$OUTPUT_DIR/$NAME"
+
+          echo "URL      : $URL"
+          echo "Referer  : ${REFERER:-<空>}"
+          echo "文件名   : $NAME"
+          echo "预期大小 : ${EXPECTED:-未知}"
+          echo "输出路径 : $OUT"
+          echo "最大轮数 : $MAX_ROUNDS   每轮间隔: ${WAIT}s"
+          echo "策略：单连接（避免 429）+ --continue 反复续传（对抗 bunkr 掐断）"
+
+          # 组装 aria2 公共参数（单连接是关键）
+          ARIA_ARGS=(
+            "--dir=$OUTPUT_DIR"
+            "--out=$NAME"
+            "--continue=true"
+            "--max-connection-per-server=1"
+            "--split=1"
+            "--max-tries=5"
+            "--retry-wait=10"
+            "--timeout=60"
+            "--connect-timeout=30"
+            "--lowest-speed-limit=1K"
+            "--allow-overwrite=false"
+            "--auto-file-renaming=false"
+            "--file-allocation=none"
+            "--http-accept-gzip=false"
+            "--summary-interval=10"
+            "--console-log-level=warn"
+            "--user-agent=$UA"
+          )
+          if [ -n "$REFERER" ]; then
+            ARIA_ARGS+=("--referer=$REFERER")
+          fi
+
+          cur_size() { stat -c%s "$OUT" 2>/dev/null || echo 0; }
+
+          prev=0
+          stall=0
+          done=0
+
+          for round in $(seq 1 "$MAX_ROUNDS"); do
+            echo ""
+            echo "==== 第 $round / $MAX_ROUNDS 轮（aria2c 单连接续传） ===="
+
+            # aria2 被掐断会返回非 0，用 || true 让循环继续
+            aria2c "${ARIA_ARGS[@]}" "$URL" || true
+
+            cur="$(cur_size)"
+            echo "本轮结束：已下载 ${cur} bytes / 预期 ${EXPECTED:-未知}"
+
+            if [ -n "$EXPECTED" ] && [ "$cur" -ge "$EXPECTED" ]; then
+              done=1
+              echo "✅ 已达到预期大小，下载完成"
+              break
+            fi
+
+            # 预期未知时，若 aria2 已把 .aria2 控制文件删除，视为完成
+            if [ -z "$EXPECTED" ] && [ ! -f "$OUT.aria2" ] && [ "$cur" -gt 0 ]; then
+              done=1
+              echo "✅ aria2 报告完成（无 .aria2 控制文件）"
+              break
+            fi
+
+            # 停滞检测：连续多轮无进展则尝试 curl 兜底
+            if [ "$cur" -le "$prev" ]; then
+              stall=$((stall + 1))
+            else
+              stall=0
+            fi
+            prev="$cur"
+
+            if [ "$stall" -ge 6 ]; then
+              echo "⚠️ 连续 $stall 轮无进展，切换 curl -C - 兜底续传"
+              break
+            fi
+
+            sleep "$WAIT"
+          done
+
+          # ---------- curl 兜底：aria2 停滞时用 curl 断点续传继续 ----------
+          if [ "$done" -ne 1 ]; then
+            echo ""
+            echo "==== curl 兜底续传阶段 ===="
+            # 移除 aria2 控制文件，避免干扰 curl 的 -C -
+            rm -f "$OUT.aria2" || true
+
+            prev="$(cur_size)"
+            stall=0
+            for cround in $(seq 1 "$MAX_ROUNDS"); do
+              echo ""
+              echo "---- curl 第 $cround 轮续传 ----"
+
+              CURL_ARGS=(
+                --location
+                --fail
+                --show-error
+                --continue-at -
+                --retry 5
+                --retry-delay 10
+                --connect-timeout 30
+                --speed-limit 1024
+                --speed-time 60
+                -A "$UA"
+                -o "$OUT"
+              )
+              if [ -n "$REFERER" ]; then
+                CURL_ARGS+=(-e "$REFERER")
+              fi
+
+              curl "${CURL_ARGS[@]}" "$URL" || true
+
+              cur="$(cur_size)"
+              echo "本轮结束：已下载 ${cur} bytes / 预期 ${EXPECTED:-未知}"
+
+              if [ -n "$EXPECTED" ] && [ "$cur" -ge "$EXPECTED" ]; then
+                done=1
+                echo "✅ 已达到预期大小，下载完成"
+                break
+              fi
+
+              if [ "$cur" -le "$prev" ]; then
+                stall=$((stall + 1))
+              else
+                stall=0
+              fi
+              prev="$cur"
+
+              if [ "$stall" -ge 8 ]; then
+                echo "⚠️ curl 连续 $stall 轮无进展，放弃"
+                break
+              fi
+
+              sleep "$WAIT"
+            done
+          fi
+
+          echo ""
+          echo "==== 结果 ===="
+          ls -lh "$OUT" 2>/dev/null || echo "输出文件不存在"
+          final="$(cur_size)"
+          echo "最终大小：$final bytes"
+
+          if [ -n "$EXPECTED" ]; then
+            if [ "$final" -ge "$EXPECTED" ]; then
+              echo "✅ 完整下载：$final / $EXPECTED"
+            else
+              pct=$(awk "BEGIN{printf \"%.1f\", $final*100/$EXPECTED}")
+              echo "::error::下载不完整：$final / $EXPECTED（$pct%）"
+              echo "可能原因：token 已过期(ex=...)、Referer 不匹配、或 bunkr 掐断过于频繁。"
+              echo "建议：换更快的 bunkr 镜像域名、确认 Referer、或缩短 per_round_wait 后重试。"
+              exit 1
+            fi
+          else
+            if [ "$final" -le 0 ]; then
+              echo "::error::未下载到任何数据"
+              exit 1
+            fi
+            echo "⚠️ 预期大小未知，已下载 $final bytes，请自行确认是否完整"
+          fi
+
+      - name: 列出下载结果
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "==== downloads 目录 ===="
+          find "$OUTPUT_DIR" -maxdepth 2 -type f -printf '%s bytes\t%p\n' 2>/dev/null | sort -n || true
+          echo "==== 占用 ===="
+          du -sh "$OUTPUT_DIR" 2>/dev/null || true
+
+      - name: 上传工件
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: cdn-download-${{ github.run_number }}
+          path: downloads/
+          if-no-files-found: warn
+          compression-level: 0
