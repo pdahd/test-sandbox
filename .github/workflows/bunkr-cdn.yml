@@ -1,0 +1,332 @@
+name: 🌩️ Bunkr CDN 慢速续传下载器-2
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: >-
+          推荐填下载页 URL（如 https://dl.bunkr.cr/file/19535114，可自动签发/续签 token）；
+          也可直接填 CDN 直链 https://xxx.cdn.cr/storage/media/...?token=...&ex=...
+        required: true
+        type: string
+
+      referer:
+        description: 留空则自动推断（下载页模式为页面域名；直链模式默认 https://dl.bunkr.cr/）
+        required: false
+        default: ""
+        type: string
+
+      limit_rate:
+        description: 单连接限速（curl 语法，如 4M / 8M / 0=不限速）。太快更容易被边缘节点掐断
+        required: false
+        default: "6M"
+        type: string
+
+      max_rounds:
+        description: 最大续传轮数
+        required: false
+        default: "800"
+        type: string
+
+      base_wait:
+        description: 每次断流后的基础等待秒数；遇 429 会在此基础上指数退避（上限 300s）
+        required: false
+        default: "15"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bunkr:
+    name: Bunkr 续传下载
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      INPUT_SOURCE: ${{ inputs.source }}
+      INPUT_REFERER: ${{ inputs.referer }}
+      INPUT_LIMIT_RATE: ${{ inputs.limit_rate }}
+      INPUT_MAX_ROUNDS: ${{ inputs.max_rounds }}
+      INPUT_BASE_WAIT: ${{ inputs.base_wait }}
+      OUTPUT_DIR: ${{ github.workspace }}/downloads
+      WORK_DIR: ${{ github.workspace }}/work
+      UA: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+
+    steps:
+      - name: 安装 curl
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl
+          curl --version | head -n 1
+          mkdir -p "$OUTPUT_DIR" "$WORK_DIR"
+
+      - name: 签发 / 解析下载链接并续传下载
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys, time
+          from pathlib import Path
+          from urllib.parse import urlsplit, parse_qs, unquote, quote
+
+          SOURCE     = os.environ["INPUT_SOURCE"].strip()
+          REF_IN     = os.environ["INPUT_REFERER"].strip()
+          LIMIT_RATE = os.environ["INPUT_LIMIT_RATE"].strip()
+          MAX_ROUNDS = int(os.environ["INPUT_MAX_ROUNDS"] or "800")
+          BASE_WAIT  = int(os.environ["INPUT_BASE_WAIT"] or "15")
+          OUT_DIR    = Path(os.environ["OUTPUT_DIR"])
+          WORK_DIR   = Path(os.environ["WORK_DIR"])
+          UA         = os.environ["UA"]
+          SIGN_API   = "https://glb-apisign.cdn.cr/sign"
+
+          def log(*a):
+              print(*a, flush=True)
+
+          def browser_headers(referer, origin=None, extra=None):
+              h = [
+                  "-A", UA,
+                  "-H", "Accept-Language: zh-CN,zh;q=0.9",
+                  "-H", 'sec-ch-ua: "Chromium";v="139", "Not;A=Brand";v="99"',
+                  "-H", "sec-ch-ua-mobile: ?0",
+                  "-H", 'sec-ch-ua-platform: "Android"',
+              ]
+              if referer:
+                  h += ["-e", referer]
+              if origin:
+                  h += ["-H", f"Origin: {origin}"]
+              for k, v in (extra or {}).items():
+                  h += ["-H", f"{k}: {v}"]
+              return h
+
+          # ------------------------------------------------------------
+          # 1. 判定输入类型
+          # ------------------------------------------------------------
+          page_id = None
+          page_origin = None
+          m = re.match(r"^(https?://[^/]*bunkr[^/]*)/(?:file|f|d)/(\d+)", SOURCE)
+          if m:
+              page_origin, page_id = m.group(1), m.group(2)
+              log(f"检测到下载页：origin={page_origin} id={page_id}")
+          elif SOURCE.startswith(("http://", "https://")):
+              log("检测到 CDN 直链")
+          else:
+              log("::error::source 必须是 bunkr 下载页 URL 或 CDN 直链")
+              sys.exit(1)
+
+          # ------------------------------------------------------------
+          # 2. 签发 token（下载页模式）
+          # ------------------------------------------------------------
+          def sign_url():
+              """返回 (url, name, ex)。复刻浏览器的两步：/api/_001_v2 → /sign"""
+              referer = REF_IN or f"{page_origin}/"
+              # 2a. 取 mediafiles / path / original
+              cmd = ["curl", "-sS", "--fail", "--max-time", "60",
+                     "-X", "POST", f"{page_origin}/api/_001_v2",
+                     "-H", "Content-Type: application/json",
+                     "-H", "Accept: */*",
+                     "--data", json.dumps({"id": page_id})]
+              cmd += browser_headers(f"{page_origin}/file/{page_id}", origin=page_origin)
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              if r.returncode != 0:
+                  raise RuntimeError(f"/api/_001_v2 失败: {r.stderr.strip()[-300:]}")
+              info = json.loads(r.stdout)
+              media, path, original = info["mediafiles"], info["path"], info.get("original") or ""
+              log(f"  mediafiles={media}  path={path}  original={original}")
+
+              # 2b. 签名
+              cmd = ["curl", "-sS", "--fail", "--max-time", "60",
+                     f"{SIGN_API}?path={quote(path, safe='')}",
+                     "-H", "Accept: */*"]
+              cmd += browser_headers(f"{page_origin}/", origin=page_origin)
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              if r.returncode != 0:
+                  raise RuntimeError(f"/sign 失败: {r.stderr.strip()[-300:]}")
+              sig = json.loads(r.stdout)
+              token, ex = sig["token"], int(sig["ex"])
+              url = f"{media}{path}?n={quote(original)}&token={token}&ex={ex}"
+              log(f"  已签发 token，过期时间 ex={ex}（{ex - int(time.time())} 秒后）")
+              return url, original, ex, referer
+
+          if page_id:
+              URL, NAME, EX, REFERER = sign_url()
+          else:
+              URL = SOURCE
+              q = parse_qs(urlsplit(URL).query)
+              NAME = unquote(q.get("n", [""])[0]) or unquote(urlsplit(URL).path.rsplit("/", 1)[-1])
+              EX = int(q.get("ex", ["0"])[0] or 0)
+              REFERER = REF_IN or "https://dl.bunkr.cr/"
+
+          NAME = re.sub(r'[\\/:*?"<>|]', "_", NAME).strip() or "download.bin"
+          OUT = OUT_DIR / NAME
+          HDR = WORK_DIR / "resp.hdr"
+          log(f"文件名：{NAME}")
+          log(f"Referer：{REFERER}")
+          log(f"限速：{LIMIT_RATE or '不限'}")
+
+          # ------------------------------------------------------------
+          # 3. 探测总大小（Range 0-0 → Content-Range）
+          # ------------------------------------------------------------
+          def probe_size(url):
+              cmd = ["curl", "-sS", "-o", "/dev/null", "-D", "-", "--max-time", "60",
+                     "-r", "0-0", "-H", "Accept: */*"] + browser_headers(REFERER) + [url]
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              for line in r.stdout.splitlines():
+                  if line.lower().startswith("content-range:"):
+                      m = re.search(r"/(\d+)", line)
+                      if m:
+                          return int(m.group(1))
+              cmd = ["curl", "-sSIL", "--max-time", "60"] + browser_headers(REFERER) + [url]
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              sizes = re.findall(r"(?i)content-length:\s*(\d+)", r.stdout)
+              return int(sizes[-1]) if sizes else 0
+
+          EXPECTED = probe_size(URL)
+          log(f"预期大小：{EXPECTED or '未知'} bytes")
+
+          # ------------------------------------------------------------
+          # 4. 单连接 + 限速 + 断点续传 + 429 退避 + token 续签
+          # ------------------------------------------------------------
+          def cur_size():
+              return OUT.stat().st_size if OUT.exists() else 0
+
+          def parse_retry_after():
+              try:
+                  txt = HDR.read_text(errors="replace")
+              except Exception:
+                  return None
+              m = re.search(r"(?im)^retry-after:\s*(\d+)", txt)
+              return int(m.group(1)) if m else None
+
+          backoff = BASE_WAIT
+          stall = 0
+          consecutive_auth_fail = 0
+          prev = cur_size()
+          t0 = time.time()
+
+          for rnd in range(1, MAX_ROUNDS + 1):
+              cur = cur_size()
+              if EXPECTED and cur >= EXPECTED:
+                  break
+
+              # token 快过期 → 续签
+              if page_id and EX and time.time() > EX - 180:
+                  log("token 即将过期，重新签发…")
+                  try:
+                      URL, _, EX, _ = sign_url()
+                  except Exception as e:
+                      log(f"续签失败：{e}")
+
+              pct = f"{cur*100/EXPECTED:.1f}%" if EXPECTED else "?"
+              log(f"\n==== 第 {rnd}/{MAX_ROUNDS} 轮  已下 {cur} bytes ({pct})  用时 {int(time.time()-t0)}s ====")
+
+              cmd = ["curl", "--silent", "--show-error",
+                     "--location", "--continue-at", "-",
+                     "--connect-timeout", "30",
+                     "--speed-limit", "20480", "--speed-time", "60",   # 60s 内 <20KB/s 视为断流
+                     "--max-time", "1800",
+                     "-D", str(HDR),
+                     "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                     "-H", "Accept-Encoding: identity",
+                     "-H", "Sec-Fetch-Dest: document",
+                     "-H", "Sec-Fetch-Mode: navigate",
+                     "-H", "Sec-Fetch-Site: cross-site",
+                     "-H", "Upgrade-Insecure-Requests: 1",
+                     "-w", "%{http_code}",
+                     "-o", str(OUT)]
+              if LIMIT_RATE and LIMIT_RATE != "0":
+                  cmd += ["--limit-rate", LIMIT_RATE]
+              cmd += browser_headers(REFERER) + [URL]
+
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              code = (r.stdout or "").strip()[-3:]
+              rc = r.returncode
+              now = cur_size()
+              gained = now - cur
+              log(f"curl 退出码={rc} HTTP={code or '-'}  本轮 +{gained} bytes  累计 {now}")
+              if r.stderr.strip():
+                  log("  " + r.stderr.strip().splitlines()[-1][:200])
+
+              if EXPECTED and now >= EXPECTED:
+                  break
+
+              # ---- 状态处理 ----
+              if code == "429":
+                  ra = parse_retry_after()
+                  wait = max(ra or 0, backoff)
+                  backoff = min(backoff * 2, 300)
+                  log(f"⚠️ 429 频率限制，等待 {wait}s（Retry-After={ra}）")
+                  time.sleep(wait)
+                  continue
+
+              if code in ("401", "403"):
+                  consecutive_auth_fail += 1
+                  if page_id and consecutive_auth_fail <= 3:
+                      log("token 失效，重新签发…")
+                      try:
+                          URL, _, EX, _ = sign_url()
+                      except Exception as e:
+                          log(f"续签失败：{e}")
+                      time.sleep(BASE_WAIT)
+                      continue
+                  log(f"::error::HTTP {code}，token/Referer 无效且无法续签")
+                  sys.exit(1)
+              consecutive_auth_fail = 0
+
+              if code == "416":
+                  log("416：服务器认为已到末尾")
+                  break
+
+              if code and code[0] in "45" and code not in ("429",):
+                  log(f"⚠️ HTTP {code}，等待 {backoff}s 后重试")
+                  time.sleep(backoff)
+                  backoff = min(backoff * 2, 300)
+                  continue
+
+              # 有进展 → 重置退避；无进展 → 逐步加长
+              if gained > 0:
+                  backoff = BASE_WAIT
+                  stall = 0
+              else:
+                  stall += 1
+                  backoff = min(backoff * 2, 300)
+                  if stall >= 25:
+                      log("::error::连续 25 轮无任何进展，放弃")
+                      break
+
+              log(f"断流/超时（rc={rc}），{backoff}s 后续传")
+              time.sleep(backoff)
+
+          # ------------------------------------------------------------
+          # 5. 结果
+          # ------------------------------------------------------------
+          final = cur_size()
+          log(f"\n==== 结果：{final} bytes / 预期 {EXPECTED or '未知'}  总用时 {int(time.time()-t0)}s ====")
+          if EXPECTED:
+              if final >= EXPECTED:
+                  log("✅ 下载完整")
+              else:
+                  log(f"::error::下载不完整 {final*100/EXPECTED:.1f}%")
+                  sys.exit(1)
+          elif final <= 0:
+              log("::error::未下载到数据")
+              sys.exit(1)
+          PY
+
+      - name: 列出结果
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          find "$OUTPUT_DIR" -type f -printf '%s bytes\t%p\n' 2>/dev/null | sort -n || true
+          du -sh "$OUTPUT_DIR" 2>/dev/null || true
+
+      - name: 上传工件
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: bunkr-download-${{ github.run_number }}
+          path: downloads/
+          if-no-files-found: warn
+          compression-level: 0
