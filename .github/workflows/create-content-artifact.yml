@@ -1,0 +1,121 @@
+name: Create Content Artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      content:
+        description: "请输入要保存到文件中的正文内容"
+        required: true
+        type: string
+
+      extension:
+        description: "扩展名文本输入，可填写 md 或 json；留空时使用下方下拉选项"
+        required: false
+        default: ""
+        type: string
+
+      extension_choice:
+        description: "选择文件扩展名"
+        required: true
+        type: choice
+        options:
+          - md
+          - json
+        default: md
+
+permissions:
+  contents: read
+
+jobs:
+  create-artifact:
+    name: Create content file
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create temporary output directory
+        shell: bash
+        env:
+          USER_CONTENT: ${{ inputs.content }}
+          USER_EXTENSION: ${{ inputs.extension }}
+          SELECTED_EXTENSION: ${{ inputs.extension_choice }}
+        run: |
+          set -euo pipefail
+
+          # 禁止 shell 调试，防止环境变量内容被回显
+          set +x
+
+          OUTPUT_DIR="${RUNNER_TEMP}/content-artifact"
+          mkdir -p "$OUTPUT_DIR"
+
+          # 文本输入框优先；为空时使用下拉菜单的选择
+          EXTENSION="${USER_EXTENSION:-$SELECTED_EXTENSION}"
+
+          # 去除可能的前后空格和开头的点号
+          EXTENSION="$(printf '%s' "$EXTENSION" | tr -d '[:space:]' | sed 's/^\.//')"
+
+          case "$EXTENSION" in
+            md|json)
+              ;;
+            *)
+              echo "错误：扩展名只能是 md 或 json。"
+              exit 1
+              ;;
+          esac
+
+          case "$EXTENSION" in
+            md)
+              OUTPUT_FILE="${OUTPUT_DIR}/submitted.md"
+              ;;
+            json)
+              OUTPUT_FILE="${OUTPUT_DIR}/submitted.json"
+              ;;
+          esac
+
+          # 使用 Python 从环境变量读取正文并写入文件。
+          # 不打印正文，不使用 cat，不在日志中回显 USER_CONTENT。
+          CONTENT="$USER_CONTENT" \
+          EXTENSION="$EXTENSION" \
+          OUTPUT_FILE="$OUTPUT_FILE" \
+          python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          content = os.environ.get("CONTENT", "")
+          extension = os.environ.get("EXTENSION", "")
+          output_file = Path(os.environ["OUTPUT_FILE"])
+
+          if extension == "md":
+              output_file.write_text(content, encoding="utf-8")
+          elif extension == "json":
+              # JSON 文件保存为合法 JSON 字符串。
+              # 如果希望用户输入的是完整 JSON 对象，可改为 json.loads 校验。
+              import json
+              output_file.write_text(
+                  json.dumps(content, ensure_ascii=False, indent=2) + "\n",
+                  encoding="utf-8"
+              )
+          else:
+              print("不支持的扩展名。", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+          chmod 600 "$OUTPUT_FILE"
+
+          # 只显示文件名和扩展名，不显示文件正文
+          echo "已生成文件：$(basename "$OUTPUT_FILE")"
+          echo "文件类型：.$EXTENSION"
+
+      - name: Upload generated file
+        uses: actions/upload-artifact@v6
+        with:
+          name: submitted-content
+          path: ${{ runner.temp }}/content-artifact/submitted.*
+          if-no-files-found: error
+
+          # GitHub Actions artifact 无法无限期保留。
+          # 90 天通常是 GitHub 允许的最大值，实际受仓库设置限制。
+          retention-days: 90
+
+          compression-level: 0
+          include-hidden-files: false
