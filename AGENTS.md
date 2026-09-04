@@ -129,3 +129,25 @@ Jules 应当：
 1. **第一优先级**：严禁向 `/app` 写入任何二进制文件（防止环境宕机崩溃）。
 2. **第二优先级**：严格排除 `Complete pre-commit step` 与 `Git commit` 步骤。
 3. **第三优先级**：默认保持 Pure Chat Mode（不擅自修改仓库）。
+
+## 9. YouTube Cookie 与 yt-dlp 使用规则
+
+系统已在环境变量 `YOUTUBE_COOKIES_B64` 保存了 base64 编码的 Netscape 格式 YouTube cookies.txt。
+
+只有当用户明确要求 Jules 使用 yt-dlp 访问 YouTube 时，Jules 才可以使用该变量。
+
+使用方式（此处 yt-dlp 命令仅为示例而已）：
+
+```bash
+umask 077
+printf '%s' "$YOUTUBE_COOKIES_B64" | base64 -d > /tmp/yt-cookies.txt
+yt-dlp --cookies /tmp/yt-cookies.txt -o '/tmp/%(title)s.%(ext)s' "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+硬性要求：
+
+1. cookie 文件只能解码到 `/tmp/`，严禁写入 `/app` 或其子目录。
+2. yt-dlp 的所有输出（视频、音频、字幕、缩略图、缓存）必须通过 `-o '/tmp/...'` 指定到 `/tmp/`，严禁落在 `/app`。必要时加 `--cache-dir /tmp/yt-cache`。
+3. 严禁在回复、日志、命令输出、任务计划或任何文件中打印 `$YOUTUBE_COOKIES_B64` 或 cookie 明文；禁止执行 `env`、`printenv`、`set -x`、`cat /tmp/yt-cookies.txt`。
+4. 任务结束后执行 `rm -f /tmp/yt-cookies.txt`。
+5. 如果 yt-dlp 报 cookie 失效或需要登录验证，直接告知用户"cookie 已过期，请重新导出"，不要尝试其他绕过手段。
