@@ -132,7 +132,7 @@ Jules 应当：
 
 ## 9. YouTube Cookie 与 yt-dlp 使用规则
 
-系统已在环境变量 `YOUTUBE_COOKIES_B64` 保存了 base64 编码的 Netscape 格式 YouTube cookies.txt。
+环境变量 `YOUTUBE_COOKIES_B64` 保存了 base64 编码的 Netscape 格式 YouTube cookies.txt。
 
 只有当用户明确要求 Jules 使用 yt-dlp 访问 YouTube 时，Jules 才可以使用该变量。
 
