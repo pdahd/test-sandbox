@@ -190,47 +190,10 @@ chmod 600 /tmp/example-file
 rm -f /tmp/example-file
 ```
 
-### 9.4 敏感变量的额外约束
+6. 若变量缺失、失效或过期，直接告知用户"该环境变量缺失或已失效，须重新提供"，不得尝试绕过验证。
 
-凡名称或用途涉及 cookie、token、key、secret、password、credential、auth、session 的变量，一律按敏感凭据处理：
-
-1. 严禁以任何形式回显、打印、展示、复制或转述其内容。
-2. 严禁写入 `README.md`、`AGENTS.md`、仓库任何文件、Git commit、任务回复或日志。
-3. 严禁写进 `set_plan` 的步骤描述中。
-4. 如需确认变量是否已配置，只判断是否非空，不得打印内容：
-
-```bash
-if [ -n "${SOME_VAR:-}" ]; then
-  echo "environment variable is present"
-else
-  echo "environment variable is missing"
-fi
-```
-
-5. 若变量缺失、失效或过期，直接告知用户"该环境变量缺失或已失效，须重新提供"，不得尝试绕过验证。
-
-### 9.5 工具产物的输出位置
+### 9.4 工具产物的输出位置
 
 使用任何外部工具时，其全部产物（下载文件、媒体、字幕、缓存、日志、临时文件、压缩包等）必须显式指定输出到 `/tmp/`，严禁落在 `/app` 或其子目录。
 
 多数工具默认输出到当前工作目录，而当前工作目录即 `/app`，因此必须通过参数显式重定向。这一点与第 7 条的二进制文件禁令一致：违反将导致 Jules 环境卡死宕机。
-
-### 9.6 完整示例
-
-以下示例仅用于说明"解码 base64 变量 → 传给工具 → 产物落 `/tmp` → 清理"的标准流程，不代表 Jules 只能使用该工具或访问该站点。
-
-```bash
-umask 077
-printf '%s' "$SOME_COOKIES_B64" | base64 -d > /tmp/cookies.txt
-chmod 600 /tmp/cookies.txt
-
-some-tool \
-  --cookies /tmp/cookies.txt \
-  --cache-dir /tmp/tool-cache \
-  -o '/tmp/output.%(ext)s' \
-  "https://example.com/resource"
-
-rm -f /tmp/cookies.txt
-```
-
-任何其他工具与变量组合，均应遵循同一模式。
