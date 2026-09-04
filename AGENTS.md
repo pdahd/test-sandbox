@@ -130,24 +130,107 @@ Jules 应当：
 2. **第二优先级**：严格排除 `Complete pre-commit step` 与 `Git commit` 步骤。
 3. **第三优先级**：默认保持 Pure Chat Mode（不擅自修改仓库）。
 
-## 9. YouTube Cookie 与 yt-dlp 使用规则
 
-环境变量 `YOUTUBE_COOKIES_B64` 保存了 base64 编码的 Netscape 格式 YouTube cookies.txt。
+## 9. 环境变量读取与使用规则
 
-只有当用户明确要求 Jules 使用 yt-dlp 访问 YouTube 时，Jules 才可以使用该变量。
+Jules 的运行环境中可能存在多个由用户在 Jules 平台配置的环境变量，用途包括凭据、令牌、配置值或文件内容。
 
-使用方式（此处 yt-dlp 命令仅为示例而已）：
+Jules 不得主动枚举、探测、打印或泄露任何环境变量。只有当用户明确要求执行的任务确实需要某个变量时，Jules 才可以读取并使用它。
+
+### 9.1 变量类型判断
+
+Jules 必须根据变量名后缀判断使用方式，不得对所有变量一律解码，也不得擅自将变量写成文件。
+
+**A. 普通变量**（变量名不以 `_B64` / `_BASE64` 结尾）
+
+* 内容为单行字符串，例如 Token、API Key、URL、配置值。
+* 直接作为命令参数、请求头或配置项引用即可。
+* 不得对其执行 base64 解码。
+* 除非用户明确要求生成文件，否则不要写入任何文件；确需写入时只能写入 `/tmp/`。
+
+**B. Base64 变量**（变量名以 `_B64` / `_BASE64` 结尾）
+
+* 内容为某个文件的 base64 编码，通常因为原始文件包含换行、Tab 或特殊字符，无法直接放入单行环境变量。
+* 仅当任务确实需要该文件时才解码。
+* 解码结果只能写入 `/tmp/`，严禁写入 `/app` 或其任何子目录。
+
+### 9.2 普通变量的使用方式
+
+直接引用变量，例如：
+
+```bash
+some-tool --token "$SOME_TOKEN"
+```
+
+要求：
+
+1. 严禁执行 `env`、`printenv`、`set`、`export -p`、`set -x` 等会列出或回显环境变量的命令。
+2. 严禁在回复、日志、命令输出、任务计划或任何文件中展示变量明文。
+3. 严禁将变量值写入 `/app` 内的任何文件。
+
+### 9.3 Base64 变量的解码方式
+
+以变量 `EXAMPLE_FILE_B64` 为例，解码为临时文件 `/tmp/example-file`：
 
 ```bash
 umask 077
-printf '%s' "$YOUTUBE_COOKIES_B64" | base64 -d > /tmp/yt-cookies.txt
-yt-dlp --cookies /tmp/yt-cookies.txt -o '/tmp/%(title)s.%(ext)s' "https://www.youtube.com/watch?v=VIDEO_ID"
+printf '%s' "$EXAMPLE_FILE_B64" | base64 -d > /tmp/example-file
+chmod 600 /tmp/example-file
 ```
 
 硬性要求：
 
-1. cookie 文件只能解码到 `/tmp/`，严禁写入 `/app` 或其子目录。
-2. yt-dlp 的所有输出（视频、音频、字幕、缩略图、缓存）必须通过 `-o '/tmp/...'` 指定到 `/tmp/`，严禁落在 `/app`。必要时加 `--cache-dir /tmp/yt-cache`。
-3. 严禁在回复、日志、命令输出、任务计划或任何文件中打印 `$YOUTUBE_COOKIES_B64` 或 cookie 明文；禁止执行 `env`、`printenv`、`set -x`、`cat /tmp/yt-cookies.txt`。
-4. 任务结束后执行 `rm -f /tmp/yt-cookies.txt`。
-5. 如果 yt-dlp 报 cookie 失效或需要登录验证，直接告知用户"cookie 已过期，请重新导出"，不要尝试其他绕过手段。
+1. 输出路径必须是 `/tmp/` 或 `/var/tmp/` 下的绝对路径。
+2. 禁止使用相对路径（当前工作目录为 `/app`）。
+3. 禁止先解码到 `/app` 再移动到 `/tmp/`，必须一步到位。
+4. 禁止 `cat`、`head`、`tail` 或以任何方式回显解码后文件的内容。
+5. 任务结束后必须删除本次生成的临时文件：
+
+```bash
+rm -f /tmp/example-file
+```
+
+### 9.4 敏感变量的额外约束
+
+凡名称或用途涉及 cookie、token、key、secret、password、credential、auth、session 的变量，一律按敏感凭据处理：
+
+1. 严禁以任何形式回显、打印、展示、复制或转述其内容。
+2. 严禁写入 `README.md`、`AGENTS.md`、仓库任何文件、Git commit、任务回复或日志。
+3. 严禁写进 `set_plan` 的步骤描述中。
+4. 如需确认变量是否已配置，只判断是否非空，不得打印内容：
+
+```bash
+if [ -n "${SOME_VAR:-}" ]; then
+  echo "environment variable is present"
+else
+  echo "environment variable is missing"
+fi
+```
+
+5. 若变量缺失、失效或过期，直接告知用户"该环境变量缺失或已失效，须重新提供"，不得尝试绕过验证。
+
+### 9.5 工具产物的输出位置
+
+使用任何外部工具时，其全部产物（下载文件、媒体、字幕、缓存、日志、临时文件、压缩包等）必须显式指定输出到 `/tmp/`，严禁落在 `/app` 或其子目录。
+
+多数工具默认输出到当前工作目录，而当前工作目录即 `/app`，因此必须通过参数显式重定向。这一点与第 7 条的二进制文件禁令一致：违反将导致 Jules 环境卡死宕机。
+
+### 9.6 完整示例
+
+以下示例仅用于说明"解码 base64 变量 → 传给工具 → 产物落 `/tmp` → 清理"的标准流程，不代表 Jules 只能使用该工具或访问该站点。
+
+```bash
+umask 077
+printf '%s' "$SOME_COOKIES_B64" | base64 -d > /tmp/cookies.txt
+chmod 600 /tmp/cookies.txt
+
+some-tool \
+  --cookies /tmp/cookies.txt \
+  --cache-dir /tmp/tool-cache \
+  -o '/tmp/output.%(ext)s' \
+  "https://example.com/resource"
+
+rm -f /tmp/cookies.txt
+```
+
+任何其他工具与变量组合，均应遵循同一模式。
