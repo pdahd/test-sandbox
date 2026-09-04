@@ -4,9 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       content:
-        description: "正文内容（不会出现在步骤日志中）"
+        description: "正文内容（单行框；多行请用 base64 或 \\n，见 input_mode）"
         required: true
         type: string
+
+      input_mode:
+        description: "正文解析方式：auto 自动判断 / raw 原样 / escaped 还原\\n / base64 解码"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - raw
+          - escaped
+          - base64
 
       basename:
         description: "文件主名（不含扩展名）"
@@ -15,7 +26,7 @@ on:
         type: string
 
       extension:
-        description: "扩展名文本框：填写后优先于下拉菜单，例如 md / json / py"
+        description: "扩展名文本框：填写后优先于下拉菜单"
         required: false
         default: ""
         type: string
@@ -45,12 +56,6 @@ on:
           - css
           - log
 
-      unescape_newlines:
-        description: '把输入中的 \n 转成真正的换行'
-        required: false
-        default: true
-        type: boolean
-
 permissions:
   contents: read
 
@@ -66,56 +71,119 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import base64
+          import binascii
+          import hashlib
           import json
           import os
           import re
           import sys
           from pathlib import Path
 
-          # 正文从事件文件读取，不经过 env 或表达式上下文，因此不会进入日志
+          # 正文只从事件文件读取，不经过 env 或表达式，因此不进日志
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
               event = json.load(f)
 
           data = event.get("inputs") or {}
 
-          content = data.get("content") or ""
+          raw = data.get("content") or ""
+          mode = (data.get("input_mode") or "auto").strip().lower()
           basename = (data.get("basename") or "submitted").strip()
           typed = (data.get("extension") or "").strip()
           chosen = (data.get("extension_choice") or "md").strip()
-          unescape = str(data.get("unescape_newlines", "false")).lower() in ("true", "1", "yes")
 
-          # 文本框优先，其次下拉菜单
+          if not raw.strip():
+              print("error: content is empty", file=sys.stderr)
+              sys.exit(1)
+
           ext = (typed or chosen).lower().lstrip(".").strip()
           if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,15}", ext):
               print("error: invalid extension", file=sys.stderr)
               sys.exit(1)
 
-          # 主名清洗，防止路径穿越
           basename = re.sub(r"[^A-Za-z0-9._-]", "_", basename).strip("._") or "submitted"
 
-          if unescape:
-              content = content.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+          def try_b64(text):
+              s = "".join(text.split())
+              if len(s) < 16 or len(s) % 4 != 0:
+                  return None
+              if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", s):
+                  return None
+              try:
+                  return base64.b64decode(s, validate=True)
+              except (binascii.Error, ValueError):
+                  return None
 
-          # 仅报告 JSON 是否合法，不打印任何正文
+          def unescape(text):
+              out = text.replace("\\r\\n", "\n").replace("\\n", "\n")
+              return out.replace("\\r", "\n").replace("\\t", "\t")
+
+          used = mode
+          payload = None
+
+          if mode == "base64":
+              decoded = try_b64(raw)
+              if decoded is None:
+                  print("error: input is not valid base64", file=sys.stderr)
+                  sys.exit(1)
+              payload = decoded
+
+          elif mode == "escaped":
+              payload = unescape(raw).encode("utf-8")
+
+          elif mode == "raw":
+              payload = raw.encode("utf-8")
+
+          else:
+              # auto：真实换行 > base64 > \n 转义 > 原样
+              if "\n" in raw or "\r" in raw:
+                  used = "raw"
+                  payload = raw.encode("utf-8")
+              else:
+                  decoded = try_b64(raw)
+                  text = None
+                  if decoded is not None:
+                      try:
+                          text = decoded.decode("utf-8")
+                      except UnicodeDecodeError:
+                          text = None
+                  if text is not None and ("\n" in text or "\t" in text):
+                      used = "base64"
+                      payload = decoded
+                  elif "\\n" in raw or "\\t" in raw:
+                      used = "escaped"
+                      payload = unescape(raw).encode("utf-8")
+                  else:
+                      used = "raw"
+                      payload = raw.encode("utf-8")
+
+          # base64 模式保持字节级原样；其余模式统一换行并补尾行
+          if used != "base64":
+              text = payload.decode("utf-8")
+              text = text.replace("\r\n", "\n").replace("\r", "\n")
+              if text and not text.endswith("\n"):
+                  text += "\n"
+              payload = text.encode("utf-8")
+
           if ext == "json":
               try:
-                  json.loads(content)
+                  json.loads(payload.decode("utf-8"))
                   print("json syntax: valid")
-              except json.JSONDecodeError:
+              except (UnicodeDecodeError, json.JSONDecodeError):
                   print("json syntax: invalid (written as-is)")
 
           out_dir = Path(os.environ["RUNNER_TEMP"]) / "content-artifact"
           out_dir.mkdir(parents=True, exist_ok=True)
           out_file = out_dir / f"{basename}.{ext}"
+          out_file.write_bytes(payload)
 
-          with open(out_file, "w", encoding="utf-8", newline="\n") as f:
-              f.write(content)
-
-          # 只输出元信息：文件名、扩展名、字节数、行数
+          # 仅输出元信息，不输出任何正文
+          print(f"mode     : {used}")
           print(f"created  : {out_file.name}")
           print(f"extension: {ext}")
-          print(f"bytes    : {out_file.stat().st_size}")
-          print(f"lines    : {content.count(chr(10)) + 1}")
+          print(f"bytes    : {len(payload)}")
+          print(f"lines    : {payload.count(chr(10).encode())}")
+          print(f"sha256   : {hashlib.sha256(payload).hexdigest()}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"filename={out_file.name}\n")
@@ -125,6 +193,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: content-${{ steps.write.outputs.extension }}
+          name: content-${{ github.run_number }}-${{ steps.write.outputs.extension }}
           path: ${{ runner.temp }}/content-artifact/
           if-no-files-found: error
