@@ -4,24 +4,52 @@ on:
   workflow_dispatch:
     inputs:
       content:
-        description: "请输入要保存到文件中的正文内容"
+        description: "正文内容（不会出现在步骤日志中）"
         required: true
         type: string
 
+      basename:
+        description: "文件主名（不含扩展名）"
+        required: false
+        default: "submitted"
+        type: string
+
       extension:
-        description: "扩展名文本输入，可填写 md 或 json；留空时使用下方下拉选项"
+        description: "扩展名文本框：填写后优先于下拉菜单，例如 md / json / py"
         required: false
         default: ""
         type: string
 
       extension_choice:
-        description: "选择文件扩展名"
+        description: "扩展名下拉菜单"
         required: true
+        default: "md"
         type: choice
         options:
           - md
           - json
-        default: md
+          - txt
+          - csv
+          - tsv
+          - html
+          - xml
+          - yaml
+          - yml
+          - toml
+          - ini
+          - py
+          - js
+          - ts
+          - sh
+          - sql
+          - css
+          - log
+
+      unescape_newlines:
+        description: '把输入中的 \n 转成真正的换行'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -32,90 +60,71 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Create temporary output directory
+      - name: Write file from event payload
+        id: write
         shell: bash
-        env:
-          USER_CONTENT: ${{ inputs.content }}
-          USER_EXTENSION: ${{ inputs.extension }}
-          SELECTED_EXTENSION: ${{ inputs.extension_choice }}
         run: |
           set -euo pipefail
-
-          # 禁止 shell 调试，防止环境变量内容被回显
-          set +x
-
-          OUTPUT_DIR="${RUNNER_TEMP}/content-artifact"
-          mkdir -p "$OUTPUT_DIR"
-
-          # 文本输入框优先；为空时使用下拉菜单的选择
-          EXTENSION="${USER_EXTENSION:-$SELECTED_EXTENSION}"
-
-          # 去除可能的前后空格和开头的点号
-          EXTENSION="$(printf '%s' "$EXTENSION" | tr -d '[:space:]' | sed 's/^\.//')"
-
-          case "$EXTENSION" in
-            md|json)
-              ;;
-            *)
-              echo "错误：扩展名只能是 md 或 json。"
-              exit 1
-              ;;
-          esac
-
-          case "$EXTENSION" in
-            md)
-              OUTPUT_FILE="${OUTPUT_DIR}/submitted.md"
-              ;;
-            json)
-              OUTPUT_FILE="${OUTPUT_DIR}/submitted.json"
-              ;;
-          esac
-
-          # 使用 Python 从环境变量读取正文并写入文件。
-          # 不打印正文，不使用 cat，不在日志中回显 USER_CONTENT。
-          CONTENT="$USER_CONTENT" \
-          EXTENSION="$EXTENSION" \
-          OUTPUT_FILE="$OUTPUT_FILE" \
           python3 - <<'PY'
+          import json
           import os
+          import re
           import sys
           from pathlib import Path
 
-          content = os.environ.get("CONTENT", "")
-          extension = os.environ.get("EXTENSION", "")
-          output_file = Path(os.environ["OUTPUT_FILE"])
+          # 正文从事件文件读取，不经过 env 或表达式上下文，因此不会进入日志
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
+              event = json.load(f)
 
-          if extension == "md":
-              output_file.write_text(content, encoding="utf-8")
-          elif extension == "json":
-              # JSON 文件保存为合法 JSON 字符串。
-              # 如果希望用户输入的是完整 JSON 对象，可改为 json.loads 校验。
-              import json
-              output_file.write_text(
-                  json.dumps(content, ensure_ascii=False, indent=2) + "\n",
-                  encoding="utf-8"
-              )
-          else:
-              print("不支持的扩展名。", file=sys.stderr)
+          data = event.get("inputs") or {}
+
+          content = data.get("content") or ""
+          basename = (data.get("basename") or "submitted").strip()
+          typed = (data.get("extension") or "").strip()
+          chosen = (data.get("extension_choice") or "md").strip()
+          unescape = str(data.get("unescape_newlines", "false")).lower() in ("true", "1", "yes")
+
+          # 文本框优先，其次下拉菜单
+          ext = (typed or chosen).lower().lstrip(".").strip()
+          if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,15}", ext):
+              print("error: invalid extension", file=sys.stderr)
               sys.exit(1)
+
+          # 主名清洗，防止路径穿越
+          basename = re.sub(r"[^A-Za-z0-9._-]", "_", basename).strip("._") or "submitted"
+
+          if unescape:
+              content = content.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+
+          # 仅报告 JSON 是否合法，不打印任何正文
+          if ext == "json":
+              try:
+                  json.loads(content)
+                  print("json syntax: valid")
+              except json.JSONDecodeError:
+                  print("json syntax: invalid (written as-is)")
+
+          out_dir = Path(os.environ["RUNNER_TEMP"]) / "content-artifact"
+          out_dir.mkdir(parents=True, exist_ok=True)
+          out_file = out_dir / f"{basename}.{ext}"
+
+          with open(out_file, "w", encoding="utf-8", newline="\n") as f:
+              f.write(content)
+
+          # 只输出元信息：文件名、扩展名、字节数、行数
+          print(f"created  : {out_file.name}")
+          print(f"extension: {ext}")
+          print(f"bytes    : {out_file.stat().st_size}")
+          print(f"lines    : {content.count(chr(10)) + 1}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"filename={out_file.name}\n")
+              f.write(f"extension={ext}\n")
           PY
 
-          chmod 600 "$OUTPUT_FILE"
-
-          # 只显示文件名和扩展名，不显示文件正文
-          echo "已生成文件：$(basename "$OUTPUT_FILE")"
-          echo "文件类型：.$EXTENSION"
-
-      - name: Upload generated file
+      - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: submitted-content
-          path: ${{ runner.temp }}/content-artifact/submitted.*
+          name: content-${{ steps.write.outputs.extension }}
+          path: ${{ runner.temp }}/content-artifact/
           if-no-files-found: error
-
-          # GitHub Actions artifact 无法无限期保留。
-          # 90 天通常是 GitHub 允许的最大值，实际受仓库设置限制。
-          retention-days: 90
-
-          compression-level: 0
-          include-hidden-files: false
