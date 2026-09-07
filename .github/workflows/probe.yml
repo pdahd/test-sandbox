@@ -1,0 +1,35 @@
+name: probe-limits
+on:
+  workflow_dispatch:
+    inputs:
+      size_gb:
+        description: '测试文件大小(GB)'
+        required: true
+        default: '6'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 查看磁盘现状
+        run: |
+          df -h
+          echo "---- /mnt ----"
+          df -h /mnt
+
+      - name: 生成测试文件
+        run: |
+          mkdir -p big
+          # 用不可压缩的随机数据，避免 zip 把体积压没了，测不准真实上限
+          head -c $(( ${{ inputs.size_gb }} * 1024 * 1024 * 1024 )) /dev/urandom > big/blob.bin
+          ls -lh big/
+          df -h
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: probe-${{ inputs.size_gb }}gb
+          path: big/blob.bin
+          retention-days: 1
+          compression-level: 0   # 关闭压缩，测的就是原始大小
+          overwrite: true
