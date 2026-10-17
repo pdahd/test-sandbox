@@ -1,49 +1,87 @@
-name: ScenaristBD Screenshot
+name: ScenaristBD Screenshot & Diagnose
 
 on:
   workflow_dispatch:
 
 jobs:
   screenshot:
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 30
     defaults:
       run:
         shell: pwsh
 
     steps:
-      - name: 下载程序
+      - name: 1. 下载与解压程序
         run: |
-          New-Item -ItemType Directory -Force dl, app, shots | Out-Null
-          Set-Location dl
-          curl.exe -L -OJ "https://1008.filemail.com/api/file/get?filekey=GUM9-Mdk59U6RMrhh_BgqIMoFQplj5HMdxffv19RurIICO7OLUFHYkRIIJqdapwTn2GD9XMU2vlHunfiiZL8ik7qh3vSrnPdFXlfI-NFuWg"
-          Get-ChildItem | Format-Table Name, Length
-
-      - name: 解压
-        run: |
+          New-Item -ItemType Directory -Force dl, app, shots, shots\decompiled | Out-Null
+          curl.exe -L --retry 3 -OJ --output-dir dl "https://1008.filemail.com/api/file/get?filekey=GUM9-Mdk59U6RMrhh_BgqIMoFQplj5HMdxffv19RurIICO7OLUFHYkRIIJqdapwTn2GD9XMU2vlHunfiiZL8ik7qh3vSrnPdFXlfI-NFuWg"
           $f = Get-ChildItem dl -File | Sort-Object Length -Descending | Select-Object -First 1
-          Write-Host "压缩包: $($f.Name)"
+          Write-Host "压缩包: $($f.Name) ($($f.Length) bytes)"
           7z x "$($f.FullName)" -o"app" -y
-          # 若解出来又是一层 .tar 等，再解一次
-          Get-ChildItem app -File -Include *.tar,*.zip,*.7z -Recurse | ForEach-Object {
+          Get-ChildItem app -File -Include *.tar,*.zip,*.7z,*.rar -Recurse | ForEach-Object {
             7z x "$($_.FullName)" -o"app" -y
           }
-          Get-ChildItem app -Recurse -Depth 2 | Select-Object FullName | Out-File shots\tree.txt
-          Get-Content shots\tree.txt
 
-      - name: 运行程序并截图
+      - name: 2. 导出配置文件并反编译入口逻辑
+        continue-on-error: true
+        run: |
+          $authDir = Get-ChildItem app -Directory -Recurse -Filter "AuthoringApplication" | Select-Object -First 1
+          "AUTH_DIR=$($authDir.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "APP_ROOT=$((Resolve-Path app).Path)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+          # 保存 config 和 manifest 内容，查看它要求的 .NET 版本与依赖
+          Get-ChildItem $authDir.FullName -Include *.config,*.manifest,*.xml -Recurse | ForEach-Object {
+            "===== $($_.FullName) =====" | Add-Content shots\configs.txt
+            Get-Content $_.FullName | Add-Content shots\configs.txt
+          }
+
+          # 比较两个目录下的 Scenarist.Licensing.dll 是否相同（排查和谐补丁位置）
+          Get-ChildItem app -Recurse -Filter "Scenarist.Licensing.dll" | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+            "$($_.FullName) | Size=$($_.Length) | SHA256=$hash" | Add-Content shots\licensing_dll_compare.txt
+          }
+
+          # 安装 ilspycmd 反编译 ScenaristBD.exe 和 Scenarist.Licensing.dll，直接看清为什么返回 -1
+          dotnet tool install -g ilspycmd
+          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
+          ilspycmd "$($authDir.FullName)\ScenaristBD.exe" -o shots\decompiled\ScenaristBD
+          ilspycmd "$($authDir.FullName)\Scenarist.Licensing.dll" -o shots\decompiled\Licensing_Root
+          if (Test-Path "$($authDir.FullName)\dll\Scenarist.Licensing.dll") {
+            ilspycmd "$($authDir.FullName)\dll\Scenarist.Licensing.dll" -o shots\decompiled\Licensing_DllDir
+          }
+
+      - name: 3. 补齐运行环境（VC++ x86 / PATH / 滤镜注册）
+        continue-on-error: true
+        run: |
+          # 安装老软件常用的 VC++ 2008 / 2010 / 2015-2022 x86 运行库
+          choco install vcredist2008 vcredist2010 vcredist140 -y --no-progress
+
+          # 用 32 位 regsvr32 静默注册 DirectShow 滤镜和解码器
+          $reg32 = "$env:windir\SysWOW64\regsvr32.exe"
+          Get-ChildItem "$env:APP_ROOT" -Include aacadec.dll,Cinemaster*.dll,Sonic*.dll,wvc1dmod.dll -Recurse | ForEach-Object {
+            Start-Process $reg32 -ArgumentList "/s `"$($_.FullName)`"" -Wait
+          }
+
+      - name: 4. 最小化干扰窗口 + 高频监控启动 ScenaristBD.exe
         run: |
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing, UIAutomationClient, UIAutomationTypes
           Add-Type @"
-          using System; using System.Runtime.InteropServices;
-          public class W {
+          using System;
+          using System.Runtime.InteropServices;
+          public class Win32 {
             [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
             [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+            [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
           }
           "@
 
           $log = "shots\log.txt"
-          function Log($m) { $t = "[{0:HH:mm:ss}] $m" -f (Get-Date); Write-Host $t; Add-Content $log $t }
+          function Log($m) {
+            $t = "[{0:HH:mm:ss.fff}] $m" -f (Get-Date)
+            Write-Host $t
+            Add-Content $log $t
+          }
 
           $script:n = 0
           function Shot($tag) {
@@ -58,86 +96,216 @@ jobs:
             Log "截图 $file"
           }
 
-          $exe = Get-ChildItem app -Recurse -Filter ScenaristBD.exe |
-                 Where-Object { $_.DirectoryName -match 'AuthoringApplication' } | Select-Object -First 1
-          if (-not $exe) { $exe = Get-ChildItem app -Recurse -Filter ScenaristBD.exe | Select-Object -First 1 }
-          if (-not $exe) { Log "没找到 ScenaristBD.exe"; exit 1 }
-          Log "启动 $($exe.FullName)"
+          # 1) 最小化桌面上原有的所有窗口（把挡路的 GitHub 黑色终端缩下去）
+          $shell = New-Object -ComObject Shell.Application
+          $shell.MinimizeAll()
+          Start-Sleep -Milliseconds 800
+          Shot "00_clean_desktop"
 
-          $p = Start-Process -FilePath $exe.FullName -WorkingDirectory $exe.DirectoryName -PassThru
-          $appRoot = (Resolve-Path app).Path
+          # 2) 把所有包含 DLL 的子目录加入 PATH（解决混合模式 DLL 找不到依赖的问题）
+          $dllDirs = @(
+            $env:APP_ROOT,
+            $env:AUTH_DIR,
+            "$env:AUTH_DIR\dll",
+            "$env:AUTH_DIR\dll\NetAdvantage",
+            "$env:AUTH_DIR\Filters",
+            "$env:AUTH_DIR\plugin",
+            "$env:APP_ROOT\MUXRemotingServer",
+            "$env:APP_ROOT\CMFRemotingServer"
+          ) -join ";"
+          $env:PATH = "$dllDirs;$env:PATH"
+
+          # 先后台启动它的两个 RemotingServer（以防主程序启动时检测本地服务）
+          $muxExe = "$env:APP_ROOT\MUXRemotingServer\MuxRemotingServer.exe"
+          $cmfExe = "$env:APP_ROOT\CMFRemotingServer\CMFRemotingServer.exe"
+          if (Test-Path $muxExe) { Start-Process $muxExe -WorkingDirectory (Split-Path $muxExe) -WindowStyle Minimized }
+          if (Test-Path $cmfExe) { Start-Process $cmfExe -WorkingDirectory (Split-Path $cmfExe) -WindowStyle Minimized }
+          Start-Sleep 2
+
+          # 3) 启动 ScenaristBD.exe，不做 5 秒盲等，立即以 200ms 间隔高频捕捉！
+          $exePath = "$env:AUTH_DIR\ScenaristBD.exe"
+          Log "启动主程序: $exePath"
+          $p = Start-Process -FilePath $exePath -WorkingDirectory $env:AUTH_DIR -PassThru
 
           $A = [System.Windows.Automation.AutomationElement]
           $TS = [System.Windows.Automation.TreeScope]
-          $okPattern = '^(&?OK|确定|是|&?Yes|&?Continue|继续|&?Next.*|下一步|I &?Agree|&?Accept|同意|&?Ignore|忽略|&?Skip|跳过|Later|稍后|Run|运行)$'
+          $okPattern = '^(&?OK|确定|是|&?Yes|&?Continue|继续|&?Next.*|下一步|I &?Agree|&?Accept|同意|&?Ignore|忽略|&?Skip|跳过|Later|稍后|Close|关闭)$'
 
-          function Get-AppWindows {
-            # 程序自身及它派生的、位于解压目录下的所有进程
-            $ids = @($p.Id) + @(Get-Process | Where-Object {
-              try { $_.Path -and $_.Path.StartsWith($appRoot) } catch { $false } } | ForEach-Object Id)
-            $ids = $ids | Select-Object -Unique
+          function Get-TargetWindows([int[]]$pids) {
             $res = @()
-            foreach ($id in $ids) {
-              $c = New-Object System.Windows.Automation.PropertyCondition($A::ProcessIdProperty, [int]$id)
-              $res += @($A::RootElement.FindAll($TS::Children, $c))
+            foreach ($id in ($pids | Select-Object -Unique)) {
+              try {
+                $c = New-Object System.Windows.Automation.PropertyCondition($A::ProcessIdProperty, [int]$id)
+                $res += @($A::RootElement.FindAll($TS::Children, $c))
+              } catch {}
             }
             return $res
           }
 
-          Start-Sleep 5
-          Shot "start"
-          $stable = 0
-          for ($i = 1; $i -le 50; $i++) {
-            Start-Sleep 3
-            $wins = Get-AppWindows
-            if ($p.HasExited -and $wins.Count -eq 0) { Log "进程已退出，退出码 $($p.ExitCode)"; Shot "exited"; break }
-
-            $clicked = $false
+          # 前 10 秒：每 250ms 轮询一次，绝不漏掉瞬间闪退的报错框或 Splash
+          $seenTitles = @{}
+          for ($ms = 0; $ms -lt 40; $ms++) {
+            Start-Sleep -Milliseconds 250
+            if ($ms -in @(1, 4, 10, 20)) { Shot "fast_${ms}" }
+            $wins = Get-TargetWindows @($p.Id)
             foreach ($w in $wins) {
-              $title = $w.Current.Name; $r = $w.Current.BoundingRectangle
-              Log "窗口: '$title'  类: $($w.Current.ClassName)  大小: $([int]$r.Width)x$([int]$r.Height)"
-              $bc = New-Object System.Windows.Automation.PropertyCondition($A::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
-              $btns = $w.FindAll($TS::Descendants, $bc)
-              # 小窗口视为对话框，才去自动点按钮，避免误点主界面
-              $isDialog = ($r.Width -lt 800 -and $r.Height -lt 600) -or $w.Current.ClassName -eq '#32770'
-              if ($isDialog) {
-                Log ("  按钮: " + (($btns | ForEach-Object { $_.Current.Name }) -join ' | '))
-                $target = $btns | Where-Object { $_.Current.Name -match $okPattern } | Select-Object -First 1
-                Shot "dialog"
-                if ($target) {
-                  Log "  点击按钮 '$($target.Current.Name)'"
-                  try { $target.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
-                  catch { [W]::SetForegroundWindow([IntPtr]$w.Current.NativeWindowHandle) | Out-Null; [System.Windows.Forms.SendKeys]::SendWait("{ENTER}") }
-                } else {
-                  Log "  未匹配到按钮，发送回车"
-                  [W]::SetForegroundWindow([IntPtr]$w.Current.NativeWindowHandle) | Out-Null
-                  [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+              $key = "$($w.Current.Name)|$($w.Current.ClassName)|$($w.Current.BoundingRectangle)"
+              if (-not $seenTitles.ContainsKey($key)) {
+                $seenTitles[$key] = $true
+                Log "捕捉到新窗口: Name='$($w.Current.Name)' Class='$($w.Current.ClassName)' Rect=$($w.Current.BoundingRectangle)"
+                # 读取窗口内所有文本控件内容（如果是报错框，直接把报错文字记入日志）
+                $allNodes = $w.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+                foreach ($n in $allNodes) {
+                  if ($n.Current.Name) { Log "  [控件 $($n.Current.ControlType.ProgrammaticName)] $($n.Current.Name)" }
                 }
-                $clicked = $true
+                Shot "new_win"
               }
             }
+            if ($p.HasExited -and $wins.Count -eq 0) {
+              Log "主程序在前 10 秒内已退出，ExitCode = $($p.ExitCode)"
+              Shot "early_exit"
+              break
+            }
+          }
 
+          # 如果主程序还活着，进入常规交互循环（自动点弹窗 + 截主界面）
+          $stable = 0
+          for ($i = 1; $i -le 35; $i++) {
+            if ($p.HasExited) { break }
+            Start-Sleep 2
+            $wins = Get-TargetWindows @($p.Id)
+            $clicked = $false
+            foreach ($w in $wins) {
+              $r = $w.Current.BoundingRectangle
+              $isDialog = ($r.Width -lt 800 -and $r.Height -lt 600) -or $w.Current.ClassName -eq '#32770'
+              if ($isDialog) {
+                Shot "dialog_$i"
+                $bc = New-Object System.Windows.Automation.PropertyCondition($A::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+                $btns = $w.FindAll($TS::Descendants, $bc)
+                Log ("弹窗按钮: " + (($btns | ForEach-Object { $_.Current.Name }) -join ' | '))
+                $target = $btns | Where-Object { $_.Current.Name -match $okPattern } | Select-Object -First 1
+                if ($target) {
+                  Log "点击按钮: $($target.Current.Name)"
+                  try { $target.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
+                  catch {
+                    [Win32]::SetForegroundWindow([IntPtr]$w.Current.NativeWindowHandle) | Out-Null
+                    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+                  }
+                  $clicked = $true
+                }
+              }
+            }
             if (-not $clicked -and $wins.Count -gt 0) {
               $stable++
-              Shot "main"
-              if ($stable -ge 4) { Log "界面已稳定"; break }   # 连续4次无对话框，认为已进入主界面
+              Shot "main_$stable"
+              if ($stable -ge 4) {
+                foreach ($w in $wins) {
+                  [Win32]::ShowWindow([IntPtr]$w.Current.NativeWindowHandle, 3) | Out-Null
+                  [Win32]::SetForegroundWindow([IntPtr]$w.Current.NativeWindowHandle) | Out-Null
+                }
+                Start-Sleep 2
+                Shot "main_maximized"
+                break
+              }
             } else { $stable = 0 }
           }
 
-          # 最大化主窗口后再截最终图
-          $wins = Get-AppWindows
-          foreach ($w in $wins) {
-            $h = [IntPtr]$w.Current.NativeWindowHandle
-            [W]::ShowWindow($h, 3) | Out-Null
-            [W]::SetForegroundWindow($h) | Out-Null
-          }
-          Start-Sleep 4
-          Shot "final"
-
-      - name: 上传截图工件
+      - name: 5. 捕获 .NET 内部异常堆栈（揭秘退出码 -1 的真正原因）
         if: always()
-        uses: actions/upload-artifact@v6
+        continue-on-error: true
+        run: |
+          # 编写一个 32 位 .NET 宿主，挂载 FirstChanceException，把 ScenaristBD.exe 吞掉的所有内部异常全部抓出来
+          $cs = @"
+          using System;
+          using System.IO;
+          using System.Reflection;
+          using System.Runtime.ExceptionServices;
+
+          class Program {
+              static StreamWriter log;
+              [STAThread]
+              static void Main(string[] args) {
+                  string exePath = args[0];
+                  string logPath = args[1];
+                  Environment.CurrentDirectory = Path.GetDirectoryName(exePath);
+                  log = new StreamWriter(logPath, false, System.Text.Encoding.UTF8) { AutoFlush = true };
+                  log.WriteLine("Starting diagnostic host for: " + exePath);
+
+                  AppDomain.CurrentDomain.FirstChanceException += (s, e) => {
+                      log.WriteLine("--- [FirstChanceException] ---");
+                      log.WriteLine(e.Exception.ToString());
+                  };
+                  AppDomain.CurrentDomain.UnhandledException += (s, e) => {
+                      log.WriteLine("=== [UnhandledException] ===");
+                      log.WriteLine(e.ExceptionObject.ToString());
+                  };
+                  AppDomain.CurrentDomain.AssemblyResolve += (s, e) => {
+                      log.WriteLine("[AssemblyResolve] Trying to resolve: " + e.Name);
+                      string baseDir = Path.GetDirectoryName(exePath);
+                      string shortName = new AssemblyName(e.Name).Name + ".dll";
+                      foreach (string sub in new[]{"", "dll", "dll\\NetAdvantage", "plugin"}) {
+                          string candidate = Path.Combine(baseDir, sub, shortName);
+                          if (File.Exists(candidate)) {
+                              log.WriteLine("  -> Loaded from: " + candidate);
+                              return Assembly.LoadFrom(candidate);
+                          }
+                      }
+                      return null;
+                  };
+
+                  try {
+                      Assembly asm = Assembly.LoadFrom(exePath);
+                      MethodInfo ep = asm.EntryPoint;
+                      log.WriteLine("EntryPoint: " + ep.DeclaringType.FullName + "." + ep.Name);
+                      object[] invokeArgs = ep.GetParameters().Length == 0 ? null : new object[]{ new string[0] };
+                      object ret = ep.Invoke(null, invokeArgs);
+                      log.WriteLine("EntryPoint returned: " + (ret ?? "void"));
+                  } catch (Exception ex) {
+                      log.WriteLine("FATAL INVOKE EXCEPTION:\n" + ex.ToString());
+                  }
+              }
+          }
+          "@
+          Set-Content -Path DiagHost.cs -Value $cs -Encoding UTF8
+          $csc = "$env:windir\Microsoft.NET\Framework\v4.0.30319\csc.exe"
+          & $csc /platform:x86 /out:DiagHost.exe DiagHost.cs
+
+          $dllDirs = "$env:APP_ROOT;$env:AUTH_DIR;$env:AUTH_DIR\dll;$env:AUTH_DIR\dll\NetAdvantage;$env:AUTH_DIR\Filters"
+          $env:PATH = "$dllDirs;$env:PATH"
+
+          $diagProc = Start-Process -FilePath "$PWD\DiagHost.exe" -ArgumentList "`"$env:AUTH_DIR\ScenaristBD.exe`" `"$PWD\shots\dotnet_exceptions.txt`"" -WorkingDirectory $env:AUTH_DIR -PassThru
+          if (-not $diagProc.WaitForExit(15000)) {
+            $diagProc.Kill()
+          }
+
+          # 同时导出 Windows 事件查看器里的 Application 错误日志
+          Get-WinEvent -LogName Application -MaxEvents 30 | Format-List TimeCreated, Id, LevelDisplayName, ProviderName, Message | Out-File shots\eventlog.txt -Encoding utf8
+
+      - name: 6. 顺带截图包内其他工具界面（对比验证）
+        if: always()
+        continue-on-error: true
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          function QuickShot($name, $exe) {
+            if (-not (Test-Path $exe)) { return }
+            $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+            Start-Sleep 4
+            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+            $bmp.Save("shots\tool_${name}.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            if (-not $proc.HasExited) { $proc.Kill() }
+          }
+          QuickShot "PNGTrimmingTool" "$env:APP_ROOT\Utilities\PNGTrimmingTool\PNGTrimmingTool.exe"
+          QuickShot "StillImageEnc"   "$env:APP_ROOT\Utilities\StillImageEncoder\StillImageEnc.exe"
+          QuickShot "MUIGenerator"    "$env:APP_ROOT\Utilities\MUI Generator\MUIGenerator.exe"
+
+      - name: 7. 上传截图与诊断工件
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          name: screenshots
+          name: screenshots-and-diagnostics
           path: shots/
           retention-days: 7
