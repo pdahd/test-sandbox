@@ -1,0 +1,143 @@
+name: ScenaristBD Screenshot
+
+on:
+  workflow_dispatch:
+
+jobs:
+  screenshot:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: 下载程序
+        run: |
+          New-Item -ItemType Directory -Force dl, app, shots | Out-Null
+          Set-Location dl
+          curl.exe -L -OJ "https://1008.filemail.com/api/file/get?filekey=GUM9-Mdk59U6RMrhh_BgqIMoFQplj5HMdxffv19RurIICO7OLUFHYkRIIJqdapwTn2GD9XMU2vlHunfiiZL8ik7qh3vSrnPdFXlfI-NFuWg"
+          Get-ChildItem | Format-Table Name, Length
+
+      - name: 解压
+        run: |
+          $f = Get-ChildItem dl -File | Sort-Object Length -Descending | Select-Object -First 1
+          Write-Host "压缩包: $($f.Name)"
+          7z x "$($f.FullName)" -o"app" -y
+          # 若解出来又是一层 .tar 等，再解一次
+          Get-ChildItem app -File -Include *.tar,*.zip,*.7z -Recurse | ForEach-Object {
+            7z x "$($_.FullName)" -o"app" -y
+          }
+          Get-ChildItem app -Recurse -Depth 2 | Select-Object FullName | Out-File shots\tree.txt
+          Get-Content shots\tree.txt
+
+      - name: 运行程序并截图
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing, UIAutomationClient, UIAutomationTypes
+          Add-Type @"
+          using System; using System.Runtime.InteropServices;
+          public class W {
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+          }
+          "@
+
+          $log = "shots\log.txt"
+          function Log($m) { $t = "[{0:HH:mm:ss}] $m" -f (Get-Date); Write-Host $t; Add-Content $log $t }
+
+          $script:n = 0
+          function Shot($tag) {
+            $script:n++
+            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+            $file = "shots\{0:D3}_{1}.png" -f $script:n, $tag
+            $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            Log "截图 $file"
+          }
+
+          $exe = Get-ChildItem app -Recurse -Filter ScenaristBD.exe |
+                 Where-Object { $_.DirectoryName -match 'AuthoringApplication' } | Select-Object -First 1
+          if (-not $exe) { $exe = Get-ChildItem app -Recurse -Filter ScenaristBD.exe | Select-Object -First 1 }
+          if (-not $exe) { Log "没找到 ScenaristBD.exe"; exit 1 }
+          Log "启动 $($exe.FullName)"
+
+          $p = Start-Process -FilePath $exe.FullName -WorkingDirectory $exe.DirectoryName -PassThru
+          $appRoot = (Resolve-Path app).Path
+
+          $A = [System.Windows.Automation.AutomationElement]
+          $TS = [System.Windows.Automation.TreeScope]
+          $okPattern = '^(&?OK|确定|是|&?Yes|&?Continue|继续|&?Next.*|下一步|I &?Agree|&?Accept|同意|&?Ignore|忽略|&?Skip|跳过|Later|稍后|Run|运行)$'
+
+          function Get-AppWindows {
+            # 程序自身及它派生的、位于解压目录下的所有进程
+            $ids = @($p.Id) + @(Get-Process | Where-Object {
+              try { $_.Path -and $_.Path.StartsWith($appRoot) } catch { $false } } | ForEach-Object Id)
+            $ids = $ids | Select-Object -Unique
+            $res = @()
+            foreach ($id in $ids) {
+              $c = New-Object System.Windows.Automation.PropertyCondition($A::ProcessIdProperty, [int]$id)
+              $res += @($A::RootElement.FindAll($TS::Children, $c))
+            }
+            return $res
+          }
+
+          Start-Sleep 5
+          Shot "start"
+          $stable = 0
+          for ($i = 1; $i -le 50; $i++) {
+            Start-Sleep 3
+            $wins = Get-AppWindows
+            if ($p.HasExited -and $wins.Count -eq 0) { Log "进程已退出，退出码 $($p.ExitCode)"; Shot "exited"; break }
+
+            $clicked = $false
+            foreach ($w in $wins) {
+              $title = $w.Current.Name; $r = $w.Current.BoundingRectangle
+              Log "窗口: '$title'  类: $($w.Current.ClassName)  大小: $([int]$r.Width)x$([int]$r.Height)"
+              $bc = New-Object System.Windows.Automation.PropertyCondition($A::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+              $btns = $w.FindAll($TS::Descendants, $bc)
+              # 小窗口视为对话框，才去自动点按钮，避免误点主界面
+              $isDialog = ($r.Width -lt 800 -and $r.Height -lt 600) -or $w.Current.ClassName -eq '#32770'
+              if ($isDialog) {
+                Log ("  按钮: " + (($btns | ForEach-Object { $_.Current.Name }) -join ' | '))
+                $target = $btns | Where-Object { $_.Current.Name -match $okPattern } | Select-Object -First 1
+                Shot "dialog"
+                if ($target) {
+                  Log "  点击按钮 '$($target.Current.Name)'"
+                  try { $target.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
+                  catch { [W]::SetForegroundWindow([IntPtr]$w.Current.NativeWindowHandle) | Out-Null; [System.Windows.Forms.SendKeys]::SendWait("{ENTER}") }
+                } else {
+                  Log "  未匹配到按钮，发送回车"
+                  [W]::SetForegroundWindow([IntPtr]$w.Current.NativeWindowHandle) | Out-Null
+                  [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+                }
+                $clicked = $true
+              }
+            }
+
+            if (-not $clicked -and $wins.Count -gt 0) {
+              $stable++
+              Shot "main"
+              if ($stable -ge 4) { Log "界面已稳定"; break }   # 连续4次无对话框，认为已进入主界面
+            } else { $stable = 0 }
+          }
+
+          # 最大化主窗口后再截最终图
+          $wins = Get-AppWindows
+          foreach ($w in $wins) {
+            $h = [IntPtr]$w.Current.NativeWindowHandle
+            [W]::ShowWindow($h, 3) | Out-Null
+            [W]::SetForegroundWindow($h) | Out-Null
+          }
+          Start-Sleep 4
+          Shot "final"
+
+      - name: 上传截图工件
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: screenshots
+          path: shots/
+          retention-days: 7
