@@ -1,337 +1,231 @@
-name: Scenarist BD 自动化安装与界面截图
+name: Scenarist BD UI screenshots
 
 on:
-  workflow_dispatch: # 允许在 GitHub 网页上手动点击运行
+  workflow_dispatch:
 
 jobs:
-  run-and-capture:
+  screenshot:
     runs-on: windows-2025
-    timeout-minutes: 60
+    timeout-minutes: 90
+    env:
+      SCENARIST_URL: ${{ secrets.SCENARIST_URL }}
+      OUT: ${{ github.workspace }}\out
+    defaults:
+      run:
+        shell: powershell   # 用 Windows PowerShell 5.1，UIAutomation 更稳定
 
     steps:
-      - name: 检出仓库代码
-        uses: actions/checkout@v4
-
-      - name: 准备 Python 运行环境
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: 安装截屏与 UI 自动化依赖库
-        shell: pwsh
+      - name: 准备桌面（最小化 runner 窗口，不关闭）
         run: |
-          python -m pip install --upgrade pip
-          pip install pywinauto pillow psutil
-
-      - name: 步骤 1：查询系统并检测/补全依赖环境
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path C:\ScenaristWork, C:\Screenshots | Out-Null
-          $logPath = "C:\ScenaristWork\dependency_audit.txt"
-          
-          Write-Host "=== 1. 系统基础信息查询 ==="
-          $os = Get-CimInstance Win32_OperatingSystem
-          "系统版本: $($os.Caption) ($($os.Version)) 架构: $($os.OSArchitecture)" | Out-File $logPath
-          
-          Write-Host "=== 2. 查询与安装 .NET Framework 2.0/3.5 ==="
-          $netfxState = (DISM /Online /Get-FeatureInfo /FeatureName:NetFx3 | Select-String "State :").ToString()
-          "NetFx3 当前状态: $netfxState" | Out-File $logPath -Append
-          if ($netfxState -notmatch "Enabled") {
-              Write-Host ".NET 2.0/3.5 未安装，正在通过 DISM 启用..."
-              DISM /Online /Enable-Feature /FeatureName:NetFx3 /All /NoRestart
-          } else {
-              Write-Host ".NET 2.0/3.5 已处于就绪状态"
+          New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\logs" | Out-Null
+          Add-Type @"
+          using System; using System.Text; using System.Runtime.InteropServices;
+          public static class W {
+            public delegate bool P(IntPtr h, IntPtr l);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(P p, IntPtr l);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
           }
-
-          Write-Host "=== 3. 依赖项与注册表初查 ==="
-          $regPaths = @(
-              "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
-          )
-          $installedApps = Get-ItemProperty $regPaths -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayName
-          "当前已安装软件摘要:" | Out-File $logPath -Append
-          ($installedApps | Where-Object { $_ -match "Java|J#|Visual C\+\+|Scenarist" }) | Out-File $logPath -Append
-
-          Get-Content $logPath
-
-      - name: 步骤 2：下载并解压 Scenarist BD 程序包
-        shell: pwsh
-        run: |
-          Set-Location C:\ScenaristWork
-          Write-Host "正在下载安装包..."
-          curl.exe -L -OJ "https://1008.filemail.com/api/file/get?filekey=qZ8PSCAMNDT_UbcUmAm998Sbdsf_rsbG0d_8ihincKT-36w0PEM-2ToKW8eACEmyrA"
-          
-          $pkg = Get-ChildItem -Path C:\ScenaristWork | Where-Object { $_.Extension -match "zip|7z|rar" } | Select-Object -First 1
-          if (-not $pkg) {
-              throw "未检测到已下载的压缩文件，请检查下载链接是否过期。"
-          }
-          Write-Host "正在解压: $($pkg.FullName)"
-          Expand-Archive -Path $pkg.FullName -DestinationPath C:\ScenaristWork\Extracted -Force
-          
-          Write-Host "解压后的目录文件树："
-          Get-ChildItem -Path C:\ScenaristWork\Extracted -Recurse | Select-Object FullName | Format-Table -AutoSize
-
-      - name: 步骤 3：补装程序包内附带的前置运行时
-        shell: pwsh
-        run: |
-          # 检查并安装 Visual J# 2.0
-          $vjredist = Get-ChildItem -Path C:\ScenaristWork\Extracted -Recurse -Filter "vjredist.exe" | Select-Object -First 1
-          if ($vjredist) {
-              Write-Host "正在静默安装 Visual J# 2.0: $($vjredist.FullName)"
-              Start-Process -FilePath $vjredist.FullName -ArgumentList "/q", "/norestart" -Wait
-          }
-
-          # 检查并尝试预装 JRE 1.5
-          $jre = Get-ChildItem -Path C:\ScenaristWork\Extracted -Recurse -Filter "jre-*.exe" | Select-Object -First 1
-          if ($jre) {
-              Write-Host "正在尝试安装 JRE 1.5: $($jre.FullName)"
-              try {
-                  Start-Process -FilePath $jre.FullName -ArgumentList "/s", "/v/qn" -Wait
-              } catch {
-                  Write-Host "JRE 静默安装遇到提示，将在随后的向导中由自动化脚本接管。"
+          "@
+          $cb = [W+P]{ param($h,$l)
+            if ([W]::IsWindowVisible($h)) {
+              $sb = New-Object Text.StringBuilder 512; [void][W]::GetWindowText($h,$sb,512)
+              $t = $sb.ToString()
+              if ($t -match 'GitHub|hosted-compute|Runner|ProgramData') {
+                Write-Host "最小化: $t"; [void][W]::ShowWindow($h,6)
               }
+            }
+            $true }
+          [void][W]::EnumWindows($cb,[IntPtr]::Zero)
+          Get-Process ServerManager -ErrorAction SilentlyContinue | Stop-Process -Force
+          try { Set-DisplayResolution -Width 1920 -Height 1080 -Force -ErrorAction Stop; "分辨率 1920x1080" }
+          catch { "分辨率调整失败，继续: $($_.Exception.Message)" }
+
+      - name: 下载并解压
+        run: |
+          if (-not $env:SCENARIST_URL) { throw "请先设置 Secret SCENARIST_URL" }
+          $f = "$env:RUNNER_TEMP\pkg.bin"
+          curl.exe -L --fail --retry 5 -o $f "$env:SCENARIST_URL"
+          if ($LASTEXITCODE) { throw "下载失败（链接可能过期）" }
+          $b = [IO.File]::ReadAllBytes($f)[0..3] | % { $_.ToString('X2') }
+          "大小 $((Get-Item $f).Length) 字节, 文件头 $($b -join ' ')"
+          & "C:\Program Files\7-Zip\7z.exe" x $f "-o$env:RUNNER_TEMP\pkg" -y | Out-Null
+          if ($LASTEXITCODE) { throw "解压失败，下载内容可能是网页而不是压缩包" }
+          $s = Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse -Filter setup.exe | Select -First 1
+          if (-not $s) { throw "未找到 setup.exe" }
+          "SETUP=$($s.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "PKGDIR=$($s.DirectoryName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 检查并补齐依赖
+        run: |
+          $log = "$env:OUT\logs\deps.txt"
+          function L($m){ $m | Tee-Object -FilePath $log -Append }
+          # .NET 2.0/3.5
+          $fx = Get-WindowsOptionalFeature -Online -FeatureName NetFx3
+          L "NetFx3: $($fx.State)"
+          if ($fx.State -ne 'Enabled') {
+            dism.exe /Online /Enable-Feature /FeatureName:NetFx3 /All /NoRestart | Out-Null
+            L "启用 NetFx3 退出码: $LASTEXITCODE"
+          }
+          # .NET 4.x
+          L ".NET4 Release: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full').Release)"
+          # JRE 1.5（32 位）
+          $jre = Get-ChildItem "$env:PKGDIR\ISSetupPrerequisites" -Recurse -Filter "jre-*.exe" | Select -First 1
+          if (-not (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment\1.5') -and $jre) {
+            $p = Start-Process $jre.FullName -ArgumentList '/s','/v"/qn REBOOT=Suppress"' -Wait -PassThru
+            L "JRE 1.5 安装退出码: $($p.ExitCode)"
+          } else { L "JRE 1.5: 已存在或安装包缺失" }
+          # Visual J# 2.0
+          $vj = Get-ChildItem "$env:PKGDIR\ISSetupPrerequisites" -Recurse -Filter "vjredist.exe" | Select -First 1
+          if (-not (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Visual JSharp Setup\Configuration\JSharp Redist\v2.0') -and $vj) {
+            $p = Start-Process $vj.FullName -ArgumentList '/q:a','/c:"install.exe /q"' -Wait -PassThru
+            L "J# 2.0 安装退出码: $($p.ExitCode)"
+          } else { L "J# 2.0: 已存在或安装包缺失" }
+          # VC++ 运行库
+          foreach ($a in 'x86','x64') {
+            $e = "$env:RUNNER_TEMP\vc_$a.exe"
+            curl.exe -sL -o $e "https://aka.ms/vs/17/release/vc_redist.$a.exe"
+            $p = Start-Process $e -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru
+            L "VC++ $a 退出码: $($p.ExitCode)"
           }
 
-      - name: 步骤 4：生成 UI 交互自动化脚本
-        shell: pwsh
+      - name: 运行 setup.exe，自动交互并截图，然后启动主程序
+        timeout-minutes: 50
         run: |
-          @'
-          import os, sys, time, re, glob, subprocess, ctypes
-          from PIL import ImageGrab
-          from pywinauto import Desktop
-          import psutil
+          Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes,System.Windows.Forms,System.Drawing
+          $shots = "$env:OUT\shots"; $log = "$env:OUT\logs\setup.txt"
+          function L($m){ "[$(Get-Date -f HH:mm:ss)] $m" | Tee-Object -FilePath $log -Append }
+          function Shot($name){
+            try {
+              $r = [Windows.Forms.SystemInformation]::VirtualScreen
+              $bmp = New-Object Drawing.Bitmap $r.Width,$r.Height
+              $g = [Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($r.Left,$r.Top,0,0,$bmp.Size)
+              $n = ($name -replace '[^\w-]','_'); if ($n.Length -gt 60) { $n = $n.Substring(0,60) }
+              $bmp.Save("$shots\KEY-$(Get-Date -f HHmmss_fff)-$n.png")
+              $g.Dispose(); $bmp.Dispose()
+            } catch { L "截图失败: $_" }
+          }
 
-          SHOT_DIR = r"C:\Screenshots"
-          os.makedirs(SHOT_DIR, exist_ok=True)
-          shot_counter = 0
+          # 后台定时截图
+          $loop = Start-Job -ArgumentList $shots -ScriptBlock {
+            param($d)
+            Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+            $i = 0
+            while (-not (Test-Path "$d\STOP")) {
+              try {
+                $r = [Windows.Forms.SystemInformation]::VirtualScreen
+                $b = New-Object Drawing.Bitmap $r.Width,$r.Height
+                $g = [Drawing.Graphics]::FromImage($b)
+                $g.CopyFromScreen($r.Left,$r.Top,0,0,$b.Size)
+                $b.Save(("$d\frame-{0:D4}.jpg" -f (++$i)), [Drawing.Imaging.ImageFormat]::Jpeg)
+                $g.Dispose(); $b.Dispose()
+              } catch {}
+              Start-Sleep -Milliseconds 1500
+            }
+          }
 
-          def save_screen(desc):
-              global shot_counter
-              shot_counter += 1
-              safe_desc = re.sub(r'[^a-zA-Z0-9_-]', '_', desc)[:45]
-              filename = os.path.join(SHOT_DIR, f"{shot_counter:03d}_{safe_desc}.png")
-              try:
-                  img = ImageGrab.grab()
-                  img.save(filename)
-                  print(f"[截图保存] {filename}")
-              except Exception as e:
-                  print(f"截图异常: {e}")
+          $UIA = [Windows.Automation.AutomationElement]
+          $TS  = [Windows.Automation.TreeScope]
+          $CT  = [Windows.Automation.ControlType]
+          function Find($root,$type){
+            $c = New-Object Windows.Automation.PropertyCondition($UIA::ControlTypeProperty,$type)
+            @($root.FindAll($TS::Descendants,$c))
+          }
+          function PageText($w){ ((Find $w $CT::Text | % { $_.Current.Name }) -join ' | ') }
 
-          def minimize_obstructive_windows():
-              """识别并最小化 GitHub Host 黑色终端及自身的控制台"""
-              user32 = ctypes.windll.user32
-              kernel32 = ctypes.windll.kernel32
-              
-              # 1. 最小化当前脚本所在的控制台
-              hwnd_self = kernel32.GetConsoleWindow()
-              if hwnd_self:
-                  user32.ShowWindow(hwnd_self, 6) # SW_MINIMIZE
+          $procRx = '^(setup|msiexec|ISBEW64|IsUninst|jre.*|vjredist|install|dotnetfx.*|isnetfx|dpinst.*|hasp.*|Sentinel.*|Scenarist.*)$'
+          $titleRx = 'Scenarist|InstallShield|Java|J#|\.NET|Sentinel|Setup|Install'
+          $acceptRx = '(?i)I accept|accept the terms|I agree|^Yes, I'
+          $btnOrder = '(?i)^&?Next','(?i)^&?Install','(?i)^&?Finish','(?i)^&?Yes$','(?i)^OK$','(?i)^&?Continue','(?i)^&?Accept'
+          $clicked = @{}; $seen = @{}
 
-              # 2. 枚举并最小化 GitHub 宿主黑窗口
-              def enum_windows_callback(hwnd, extra):
-                  if not user32.IsWindowVisible(hwnd):
-                      return True
-                  length = user32.GetWindowTextLengthW(hwnd)
-                  if length > 0:
-                      buff = ctypes.create_unicode_buffer(length + 1)
-                      user32.GetWindowTextW(hwnd, buff, length + 1)
-                      title = buff.value
-                      # 命中图片中的终端特征
-                      if any(k in title for k in ["GitHub", "Host", "hosted-compute-agent", "WindowsTerminal"]):
-                          user32.ShowWindow(hwnd, 6)
-                          print(f"[已最小化干扰窗口] {title}")
-                  return True
+          Shot "00-desktop-before-setup"
+          $setup = Start-Process $env:SETUP -WorkingDirectory $env:PKGDIR -PassThru
+          L "已启动 setup.exe PID=$($setup.Id)"
+          $deadline = (Get-Date).AddMinutes(40); $idle = 0
 
-              WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-              user32.EnumWindows(WNDENUMPROC(enum_windows_callback), 0)
+          while ((Get-Date) -lt $deadline) {
+            $wins = @($UIA::RootElement.FindAll($TS::Children, [Windows.Automation.Condition]::TrueCondition) | ? {
+              $p = Get-Process -Id $_.Current.ProcessId -ErrorAction SilentlyContinue
+              $p -and ($p.ProcessName -match $procRx -or ($_.Current.Name -match $titleRx -and $p.ProcessName -notmatch 'explorer|WindowsTerminal|conhost|powershell'))
+            })
 
-          def collect_family_pids(root_pid):
-              """递归获取主进程产生的所有子进程PID"""
-              pids = {root_pid}
-              try:
-                  parent = psutil.Process(root_pid)
-                  for child in parent.children(recursive=True):
-                      pids.add(child.pid)
-              except Exception:
-                  pass
-              return pids
+            if ($wins.Count -eq 0 -and $setup.HasExited -and -not (Get-Process msiexec,ISBEW64 -ErrorAction SilentlyContinue | ? { $_.MainWindowHandle -ne 0 })) {
+              if (++$idle -ge 15) { L "安装窗口已全部消失"; break }
+            } else { $idle = 0 }
 
-          def run_installation_loop(setup_path):
-              print(f"启动安装程序: {setup_path}")
-              minimize_obstructive_windows()
-              time.sleep(1)
-              save_screen("00_clean_desktop_before_launch")
+            foreach ($w in $wins) {
+              try {
+                $txt = PageText $w
+                $key = "$($w.Current.NativeWindowHandle)|$txt"
+                if (-not $seen[$key]) {
+                  $seen[$key] = 1
+                  L "新页面 [$($w.Current.Name)]: $txt"
+                  L ("  按钮: " + ((Find $w $CT::Button | % { $_.Current.Name }) -join ', '))
+                  Shot "page-$($w.Current.Name)"
+                }
 
-              proc = subprocess.Popen([setup_path], cwd=os.path.dirname(setup_path))
-              print(f"setup.exe 进程 PID: {proc.pid}")
+                # 1) 勾选同意许可
+                foreach ($r in (Find $w $CT::RadioButton | ? { $_.Current.Name -match $acceptRx -and $_.Current.IsEnabled })) {
+                  $sp = $r.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern)
+                  if (-not $sp.Current.IsSelected) { $sp.Select(); L "选择: $($r.Current.Name)"; Start-Sleep 1 }
+                }
+                foreach ($c in (Find $w $CT::CheckBox | ? { $_.Current.Name -match $acceptRx -and $_.Current.IsEnabled })) {
+                  $tp = $c.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern)
+                  if ($tp.Current.ToggleState -ne 'On') { $tp.Toggle(); L "勾选: $($c.Current.Name)"; Start-Sleep 1 }
+                }
 
-              timeout = time.time() + 25 * 60 # 最长等待 25 分钟
-              BUTTON_NORMAL_PRIORITY = ["i accept", "agree", "next", "install", "finish", "complete", "ok", "yes", "continue", "close"]
-              BUTTON_REBOOT_PRIORITY = ["no", "later", "restart later", "don't restart", "finish", "close"]
+                $buttons = Find $w $CT::Button | ? { $_.Current.IsEnabled }
 
-              last_clicked_text = ""
-              same_state_count = 0
+                # 2) 重启提示：只选稍后，绝不重启
+                if ($txt -match '(?i)restart|reboot') {
+                  foreach ($r in (Find $w $CT::RadioButton | ? { $_.Current.Name -match '(?i)later|No,' })) {
+                    $r.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select(); L "选择稍后重启"
+                  }
+                  $no = $buttons | ? { $_.Current.Name -match '(?i)^&?No$' } | Select -First 1
+                  if ($no) { Shot "before-No"; $no.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke(); L "点击 No（不重启）"; Start-Sleep 2; continue }
+                }
 
-              while time.time() < timeout:
-                  if proc.poll() is not None:
-                      print(f"主安装进程已退出，退出码: {proc.returncode}")
-                      break
+                # 3) 按优先级点击推进按钮（从不点 Cancel/Back）
+                foreach ($rx in $btnOrder) {
+                  $b = $buttons | ? { $_.Current.Name -match $rx -and $_.Current.Name -notmatch '(?i)cancel|back' } | Select -First 1
+                  if (-not $b) { continue }
+                  $ck = "$key|$($b.Current.Name)"
+                  if ($clicked[$ck] -and ((Get-Date) - $clicked[$ck]).TotalSeconds -lt 12) { break }
+                  Shot "before-$($b.Current.Name)"
+                  $b.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+                  $clicked[$ck] = Get-Date
+                  L "点击 [$($b.Current.Name)] @ [$($w.Current.Name)]"
+                  Start-Sleep 2; Shot "after-$($b.Current.Name)"
+                  break
+                }
+              } catch { L "窗口处理异常: $($_.Exception.Message)" }
+            }
+            Start-Sleep -Milliseconds 1000
+          }
+          Shot "setup-end"
 
-                  minimize_obstructive_windows()
-                  allowed_pids = collect_family_pids(proc.pid)
+          # 启动主程序
+          $exe = Get-ChildItem "C:\Program Files","C:\Program Files (x86)" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+                 ? { $_.Name -match '(?i)scenarist' -and $_.Name -notmatch '(?i)unins|setup|crash' } |
+                 Sort-Object { if ($_.Name -match '(?i)^Scenarist\s*BD') {0} else {1} } | Select -First 1
+          if ($exe) {
+            L "启动主程序: $($exe.FullName)"
+            Start-Process $exe.FullName -WorkingDirectory $exe.DirectoryName
+            1..40 | % { Start-Sleep 3; Shot "main-$_" }
+            Get-Process | ? { $_.MainWindowTitle } | % { L "窗口: [$($_.ProcessName)] $($_.MainWindowTitle)" }
+          } else { L "未找到 Scenarist 主程序，安装可能失败"; Shot "no-main-exe" }
 
-                  try:
-                      windows = Desktop(backend="uia").windows()
-                  except Exception:
-                      windows = []
+          New-Item "$shots\STOP" -ItemType File | Out-Null
+          Wait-Job $loop -Timeout 10 | Out-Null; Remove-Job $loop -Force
+          Remove-Item "$shots\STOP"
 
-                  handled_dialog = False
-                  for w in windows:
-                      try:
-                          if not w.is_visible() or w.process_id() not in allowed_pids:
-                              continue
-                          title = w.window_text().strip()
-                          if not title:
-                              continue
-                      except Exception:
-                          continue
-
-                      handled_dialog = True
-                      save_screen(f"dlg_{title}")
-
-                      # 步骤 A：自动勾选协议条款 (CheckBox & RadioButton)
-                      for ctrl_type in ["CheckBox", "RadioButton"]:
-                          try:
-                              for item in w.descendants(control_type=ctrl_type):
-                                  text = item.window_text().strip()
-                                  if re.search(r"accept|agree|同意|yes", text, re.I):
-                                      try:
-                                          item.click_input()
-                                          print(f"勾选协议选项: [{text}]")
-                                          time.sleep(1)
-                                      except Exception:
-                                          pass
-                          except Exception:
-                              pass
-
-                      # 步骤 B：搜寻可点击按钮
-                      buttons = []
-                      try:
-                          for b in w.descendants(control_type="Button"):
-                              bt = b.window_text().strip()
-                              if bt:
-                                  buttons.append((b, bt))
-                      except Exception:
-                          pass
-
-                      combined_dialog_text = (title + " " + " ".join([bt for _, bt in buttons])).lower()
-                      # 如果检测到关机/重启警告，强制先点击 No/Later
-                      is_reboot_prompt = any(k in combined_dialog_text for k in ["restart", "reboot", "重启"])
-                      priority_list = BUTTON_REBOOT_PRIORITY if is_reboot_prompt else BUTTON_NORMAL_PRIORITY
-
-                      clicked = False
-                      for keyword in priority_list:
-                          pattern = r"\b" + re.escape(keyword) + r"\b"
-                          for btn_obj, btn_text in buttons:
-                              if re.search(pattern, btn_text, re.I):
-                                  try:
-                                      print(f"正在点击窗口 [{title}] 上的按钮: [{btn_text}]")
-                                      btn_obj.click_input()
-                                      clicked = True
-                                      time.sleep(3)
-                                      save_screen(f"after_click_{btn_text}")
-                                      break
-                                  except Exception as ex:
-                                      print(f"点击按钮失败: {ex}")
-                          if clicked:
-                              break
-
-                      if not clicked:
-                          # 可能是文件解压或进度复制中，等待更长时间
-                          time.sleep(8)
-
-                  if not handled_dialog:
-                      time.sleep(4)
-
-              save_screen("99_install_phase_end")
-
-          def launch_installed_program():
-              """寻找安装后的 Scenarist BD 并启动主程序界面截屏"""
-              print("=== 开始查找并启动主程序 ===")
-              search_dirs = [r"C:\Program Files\**\*.exe", r"C:\Program Files (x86)\**\*.exe"]
-              candidates = []
-              for pattern in search_dirs:
-                  candidates.extend(glob.glob(pattern, recursive=True))
-
-              app_exe = None
-              for exe in candidates:
-                  low = exe.lower()
-                  if "scenarist" in low and not any(k in low for k in ["uninstall", "unins", "setup", "update"]):
-                      app_exe = exe
-                      break
-
-              if not app_exe:
-                  print("未能在标准安装路径找到 Scenarist 主程序，将查找任意新创建的可执行文件...")
-                  for exe in candidates:
-                      if "scenarist" in exe.lower():
-                          app_exe = exe
-                          break
-
-              if app_exe:
-                  print(f"启动 Scenarist 主程序: {app_exe}")
-                  minimize_obstructive_windows()
-                  try:
-                      p = subprocess.Popen([app_exe], cwd=os.path.dirname(app_exe))
-                  except Exception as e:
-                      print(f"启动主程序失败: {e}")
-                      return
-
-                  # 启动后多阶段截图（捕捉 Splash 欢迎动画、可能的 License 报错、主窗口）
-                  for wait_sec, stage in [(6, "app_splash_loading"), (15, "app_main_initial"), (25, "app_main_settled")]:
-                      time.sleep(wait_sec)
-                      minimize_obstructive_windows()
-                      # 尝试将主程序窗口前置并最大化
-                      try:
-                          for w in Desktop(backend="uia").windows():
-                              if "scenarist" in w.window_text().lower():
-                                  w.set_focus()
-                                  w.maximize()
-                      except Exception:
-                          pass
-                      save_screen(stage)
-              else:
-                  print("未找到 Scenarist 主程序文件。")
-                  save_screen("app_not_found")
-
-          if __name__ == "__main__":
-              setup_file = None
-              for f in glob.glob(r"C:\ScenaristWork\Extracted\**\setup.exe", recursive=True):
-                  if "isprerequisite" not in f.lower():
-                      setup_file = f
-                      break
-
-              if setup_file and os.path.exists(setup_file):
-                  run_installation_loop(setup_file)
-              else:
-                  print("未定位到主 setup.exe 文件！")
-                  save_screen("err_no_setup_found")
-
-              launch_installed_program()
-          '@ | Out-File -FilePath "C:\ScenaristWork\run_driver.py" -Encoding utf8
-          python -c "import ast; ast.parse(open('C:/ScenaristWork/run_driver.py', encoding='utf-8').read()); print('Driver 语法校验无误')"
-
-      - name: 步骤 5：执行安装交互与截图驱动
-        shell: pwsh
-        run: |
-          python C:\ScenaristWork\run_driver.py
-        continue-on-error: true
-
-      - name: 步骤 6：打包上传所有截图与日志工件
-        if: always() # 无论此前步骤成功或异常，均无条件上传已有截图
-        uses: actions/upload-artifact@v4
+      - name: 上传截图和日志
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          name: Scenarist-UI-Screenshots
-          path: |
-            C:\Screenshots\*.png
-            C:\ScenaristWork\dependency_audit.txt
+          name: scenarist-screens-${{ github.run_number }}
+          path: out/
           retention-days: 14
