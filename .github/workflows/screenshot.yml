@@ -1,231 +1,310 @@
-name: Scenarist BD UI screenshots
+name: Scenarist BD - install & screenshot
 
 on:
   workflow_dispatch:
+    inputs:
+      setup_timeout_min:
+        description: "安装向导自动交互最长等待（分钟）"
+        default: "35"
+
+env:
+  PKG_URL: "https://1008.filemail.com/api/file/get?filekey=qZ8PSCAMNDT_UbcUmAm998Sbdsf_rsbG0d_8ihincKT-36w0PEM-2ToKW8eACEmyrA"
+  OUT: ${{ github.workspace }}\out
 
 jobs:
-  screenshot:
+  capture:
     runs-on: windows-2025
-    timeout-minutes: 90
-    env:
-      SCENARIST_URL: ${{ secrets.SCENARIST_URL }}
-      OUT: ${{ github.workspace }}\out
+    timeout-minutes: 110
     defaults:
       run:
-        shell: powershell   # 用 Windows PowerShell 5.1，UIAutomation 更稳定
+        shell: powershell      # 必须是 Windows PowerShell 5.1，UIAutomation 在 pwsh 7 下不稳定
 
     steps:
-      - name: 准备桌面（最小化 runner 窗口，不关闭）
+      # ------------------------------------------------------------------
+      - name: 1. 桌面自检、最小化 runner 黑窗口、尝试提高分辨率
         run: |
           New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\logs" | Out-Null
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           Add-Type @"
           using System; using System.Text; using System.Runtime.InteropServices;
-          public static class W {
-            public delegate bool P(IntPtr h, IntPtr l);
-            [DllImport("user32.dll")] public static extern bool EnumWindows(P p, IntPtr l);
+          public static class U32 {
+            public delegate bool EnumProc(IntPtr h, IntPtr l);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
             [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
             [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+            [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+            [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+            public struct DEVMODE {
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName;
+              public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra; public int dmFields;
+              public int dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+              public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName;
+              public short dmLogPixels; public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+              public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight; }
+            [DllImport("user32.dll")] public static extern int EnumDisplaySettings(string n, int mode, ref DEVMODE dm);
+            [DllImport("user32.dll")] public static extern int ChangeDisplaySettings(ref DEVMODE dm, int flags);
           }
           "@
-          $cb = [W+P]{ param($h,$l)
-            if ([W]::IsWindowVisible($h)) {
-              $sb = New-Object Text.StringBuilder 512; [void][W]::GetWindowText($h,$sb,512)
-              $t = $sb.ToString()
-              if ($t -match 'GitHub|hosted-compute|Runner|ProgramData') {
-                Write-Host "最小化: $t"; [void][W]::ShowWindow($h,6)
-              }
-            }
+          [void][U32]::SetProcessDPIAware()
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "OS: $($os.Caption) | $($os.Version) | $($os.OSArchitecture)"
+          Write-Host "Session: $((Get-Process -Id $PID).SessionId)  UserInteractive: $([Environment]::UserInteractive)  Explorer: $([bool](Get-Process explorer -EA SilentlyContinue))"
+
+          # 最小化 hosted-compute-agent 控制台（不要关闭！）
+          $cb = [U32+EnumProc]{ param($h, $l)
+            if ([U32]::IsWindowVisible($h)) {
+              $sb = New-Object System.Text.StringBuilder 1024
+              [void][U32]::GetWindowText($h, $sb, 1024); $t = $sb.ToString()
+              if ($t -and $t -match 'ProgramData\\GitHub|hosted-compute|Runner\.Listener') {
+                Write-Host "minimize: $t"; [void][U32]::ShowWindow($h, 6) } }
             $true }
-          [void][W]::EnumWindows($cb,[IntPtr]::Zero)
-          Get-Process ServerManager -ErrorAction SilentlyContinue | Stop-Process -Force
-          try { Set-DisplayResolution -Width 1920 -Height 1080 -Force -ErrorAction Stop; "分辨率 1920x1080" }
-          catch { "分辨率调整失败，继续: $($_.Exception.Message)" }
+          [void][U32]::EnumWindows($cb, [IntPtr]::Zero)
+          Get-Process ServerManager -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
 
-      - name: 下载并解压
+          # 尝试提高分辨率（Hyper-V 虚拟显卡不一定支持，失败就算了）
+          $dm = New-Object U32+DEVMODE; $dm.dmSize = [Runtime.InteropServices.Marshal]::SizeOf($dm)
+          [void][U32]::EnumDisplaySettings($null, -1, [ref]$dm)
+          foreach ($res in @(@(1920,1080), @(1600,1200), @(1280,1024))) {
+            $dm.dmPelsWidth = $res[0]; $dm.dmPelsHeight = $res[1]; $dm.dmFields = 0x80000 -bor 0x100000
+            $rc = [U32]::ChangeDisplaySettings([ref]$dm, 0)
+            if ($rc -eq 0) { Write-Host "resolution -> $($res[0])x$($res[1])"; break } else { Write-Host "resolution $($res[0])x$($res[1]) rejected ($rc)" } }
+          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          Write-Host "Screen now: $($scr.Width)x$($scr.Height)"
+
+          # 基线截图：这一步失败说明根本没有可交互桌面，早死早超生
+          $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
+          $g = [System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen(0,0,0,0,$b.Size)
+          $b.Save("$env:OUT\shots\K_000000_baseline_desktop.png"); $g.Dispose(); $b.Dispose()
+
+      # ------------------------------------------------------------------
+      - name: 2. 下载并解压安装包
         run: |
-          if (-not $env:SCENARIST_URL) { throw "请先设置 Secret SCENARIST_URL" }
           $f = "$env:RUNNER_TEMP\pkg.bin"
-          curl.exe -L --fail --retry 5 -o $f "$env:SCENARIST_URL"
-          if ($LASTEXITCODE) { throw "下载失败（链接可能过期）" }
-          $b = [IO.File]::ReadAllBytes($f)[0..3] | % { $_.ToString('X2') }
-          "大小 $((Get-Item $f).Length) 字节, 文件头 $($b -join ' ')"
-          & "C:\Program Files\7-Zip\7z.exe" x $f "-o$env:RUNNER_TEMP\pkg" -y | Out-Null
-          if ($LASTEXITCODE) { throw "解压失败，下载内容可能是网页而不是压缩包" }
-          $s = Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse -Filter setup.exe | Select -First 1
-          if (-not $s) { throw "未找到 setup.exe" }
-          "SETUP=$($s.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "PKGDIR=$($s.DirectoryName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          curl.exe -L --fail --retry 3 --retry-delay 5 -A "Mozilla/5.0" -o $f "$env:PKG_URL"
+          if ($LASTEXITCODE -ne 0) { throw "下载失败 (curl exit $LASTEXITCODE)，Filemail 链接可能已过期" }
+          $fi = Get-Item $f
+          $fs = [IO.File]::OpenRead($f); $hb = New-Object byte[] 8; [void]$fs.Read($hb,0,8); $fs.Close()
+          Write-Host "size=$($fi.Length)  magic=$(($hb | % { $_.ToString('X2') }) -join ' ')"
+          if ($fi.Length -lt 1MB) { Get-Content $f -TotalCount 20; throw "文件太小，拿到的多半是 HTML 错误页，不是压缩包" }
+          & "C:\Program Files\7-Zip\7z.exe" x $f "-o$env:RUNNER_TEMP\pkg" -y | Select-Object -Last 4
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip 解压失败 (exit $LASTEXITCODE)" }
+          Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse | % { "{0,12}  {1}" -f $_.Length, $_.FullName } | Tee-Object "$env:OUT\logs\package-tree.txt"
+          $setup = Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse -Filter setup.exe | Select-Object -First 1
+          if (-not $setup) { throw "没有找到 setup.exe" }
+          "SETUP_EXE=$($setup.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "PKG_DIR=$($setup.DirectoryName)"  | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "setup.exe => $($setup.FullName)"
 
-      - name: 检查并补齐依赖
+      # ------------------------------------------------------------------
+      - name: 3. 查询系统依赖，缺什么装什么
+        timeout-minutes: 30
         run: |
-          $log = "$env:OUT\logs\deps.txt"
-          function L($m){ $m | Tee-Object -FilePath $log -Append }
-          # .NET 2.0/3.5
+          $log = "$env:OUT\logs\dependencies.txt"
+          function L($m){ $s = "[$(Get-Date -f HH:mm:ss)] $m"; Write-Host $s; Add-Content $log $s }
+          function Installed($rx){ Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -EA SilentlyContinue | ? { $_.DisplayName -match $rx } | % DisplayName }
+          function Run($exe,$a,$label){
+            if (-not $exe -or -not (Test-Path $exe)) { L "$label : 安装包不存在，跳过"; return }
+            try { $p = Start-Process -FilePath $exe -ArgumentList $a -Wait -PassThru; L "$label : exit $($p.ExitCode)  (0=成功 3010=需重启 1638/5100=已存在或系统不支持)" }
+            catch { L "$label : 异常 $($_.Exception.Message)" } }
+
+          L "=== Windows Installer 服务 ==="
+          Start-Service msiserver -EA SilentlyContinue; L "msiserver: $((Get-Service msiserver).Status)"
+
+          L "=== .NET Framework 2.0 / 3.5 (NetFx3) ==="
           $fx = Get-WindowsOptionalFeature -Online -FeatureName NetFx3
-          L "NetFx3: $($fx.State)"
+          L "NetFx3 当前: $($fx.State)"
           if ($fx.State -ne 'Enabled') {
-            dism.exe /Online /Enable-Feature /FeatureName:NetFx3 /All /NoRestart | Out-Null
-            L "启用 NetFx3 退出码: $LASTEXITCODE"
-          }
-          # .NET 4.x
-          L ".NET4 Release: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full').Release)"
-          # JRE 1.5（32 位）
-          $jre = Get-ChildItem "$env:PKGDIR\ISSetupPrerequisites" -Recurse -Filter "jre-*.exe" | Select -First 1
-          if (-not (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment\1.5') -and $jre) {
-            $p = Start-Process $jre.FullName -ArgumentList '/s','/v"/qn REBOOT=Suppress"' -Wait -PassThru
-            L "JRE 1.5 安装退出码: $($p.ExitCode)"
-          } else { L "JRE 1.5: 已存在或安装包缺失" }
-          # Visual J# 2.0
-          $vj = Get-ChildItem "$env:PKGDIR\ISSetupPrerequisites" -Recurse -Filter "vjredist.exe" | Select -First 1
-          if (-not (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Visual JSharp Setup\Configuration\JSharp Redist\v2.0') -and $vj) {
-            $p = Start-Process $vj.FullName -ArgumentList '/q:a','/c:"install.exe /q"' -Wait -PassThru
-            L "J# 2.0 安装退出码: $($p.ExitCode)"
-          } else { L "J# 2.0: 已存在或安装包缺失" }
-          # VC++ 运行库
+            try { $r = Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -EA Stop; L "Enable-WindowsOptionalFeature 完成, RestartNeeded=$($r.RestartNeeded)" }
+            catch { L "Enable 失败: $($_.Exception.Message)，改用 DISM"; dism.exe /Online /Enable-Feature /FeatureName:NetFx3 /All /NoRestart | Out-Null; L "dism exit $LASTEXITCODE" }
+            L "NetFx3 现在: $((Get-WindowsOptionalFeature -Online -FeatureName NetFx3).State)" }
+          L ".NET 2.0 注册表版本: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v2.0.50727' -EA SilentlyContinue).Version)"
+          L ".NET 4.x Release: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -EA SilentlyContinue).Release)"
+          L "（包内 dotnetfx20.exe / isnetfx.exe 不单独运行：Server 2025 会拒绝 .NET 2.0 独立安装包，NetFx3 功能已包含 2.0 运行时）"
+
+          L "=== Visual J# 2.0 Redistributable ==="
+          $vjHas = (Installed 'Visual J#') -or (Get-ChildItem "$env:windir\assembly" -Recurse -Filter vjslib.dll -EA SilentlyContinue)
+          if ($vjHas) { L "J# 已存在: $(Installed 'Visual J#')" }
+          else { $vj = Get-ChildItem "$env:PKG_DIR\ISSetupPrerequisites" -Recurse -Filter vjredist.exe | Select -First 1
+                 Run $vj.FullName '/q:a /c:"install.exe /q"' 'J# 2.0'
+                 L "J# 安装后: $(Installed 'Visual J#')" }
+
+          L "=== Java Runtime 1.5 (32-bit) ==="
+          $jreHas = (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment\1.5') -or (Installed 'J2SE Runtime Environment 5|Java\(TM\) 2 Runtime|Java 5')
+          if ($jreHas) { L "JRE 1.5 已存在" }
+          else { $jre = Get-ChildItem "$env:PKG_DIR\ISSetupPrerequisites" -Recurse -Filter "jre-*.exe" | Select -First 1
+                 Run $jre.FullName '/s /v"/qn REBOOT=Suppress"' 'JRE 1.5.0_07'
+                 L "JRE 注册表: $(Test-Path 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment\1.5')" }
+
+          L "=== Visual C++ 运行库 ==="
+          Installed 'Visual C\+\+' | sort -Unique | % { L "  已有: $_" }
           foreach ($a in 'x86','x64') {
-            $e = "$env:RUNNER_TEMP\vc_$a.exe"
-            curl.exe -sL -o $e "https://aka.ms/vs/17/release/vc_redist.$a.exe"
-            $p = Start-Process $e -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru
-            L "VC++ $a 退出码: $($p.ExitCode)"
-          }
+            if (-not (Installed "Visual C\+\+ 2015-20\d\d.*$a")) {
+              $e = "$env:RUNNER_TEMP\vc_$a.exe"; curl.exe -sL -o $e "https://aka.ms/vs/17/release/vc_redist.$a.exe"
+              Run $e '/install /quiet /norestart' "VC++ 2015-2022 $a" } }
 
-      - name: 运行 setup.exe，自动交互并截图，然后启动主程序
-        timeout-minutes: 50
+          L "=== DirectX 9 旧运行库 (d3dx9) ==="
+          if (Test-Path "$env:windir\SysWOW64\d3dx9_43.dll") { L "d3dx9_43.dll 已存在" }
+          else { $dx = "$env:RUNNER_TEMP\dxwebsetup.exe"
+                 curl.exe -sL --fail -o $dx "https://download.microsoft.com/download/1/7/1/1718CCC4-6315-4D8E-9543-8E28A4E18C4C/dxwebsetup.exe"
+                 if ($LASTEXITCODE -eq 0) { Run $dx '/Q' 'DirectX End-User Runtime' } else { L "dxwebsetup 下载失败，跳过" } }
+
+          L "=== Media Foundation (Server 版默认可能未装) ==="
+          try { $mf = Get-WindowsFeature Server-Media-Foundation -EA Stop; L "Server-Media-Foundation: $($mf.InstallState)"
+                if ($mf.InstallState -ne 'Installed') { $r = Install-WindowsFeature Server-Media-Foundation -EA Stop; L "安装结果: Success=$($r.Success) Restart=$($r.RestartNeeded)" } }
+          catch { L "Media Foundation 检查失败: $($_.Exception.Message)" }
+          L "=== 依赖处理结束 ==="
+
+      # ------------------------------------------------------------------
+      - name: 4. 运行 setup.exe，自动交互 + 全程截图，然后启动主程序
+        timeout-minutes: 60
+        env:
+          SETUP_TIMEOUT_MIN: ${{ inputs.setup_timeout_min || '35' }}
         run: |
-          Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes,System.Windows.Forms,System.Drawing
-          $shots = "$env:OUT\shots"; $log = "$env:OUT\logs\setup.txt"
-          function L($m){ "[$(Get-Date -f HH:mm:ss)] $m" | Tee-Object -FilePath $log -Append }
-          function Shot($name){
-            try {
-              $r = [Windows.Forms.SystemInformation]::VirtualScreen
-              $bmp = New-Object Drawing.Bitmap $r.Width,$r.Height
-              $g = [Drawing.Graphics]::FromImage($bmp)
-              $g.CopyFromScreen($r.Left,$r.Top,0,0,$bmp.Size)
-              $n = ($name -replace '[^\w-]','_'); if ($n.Length -gt 60) { $n = $n.Substring(0,60) }
-              $bmp.Save("$shots\KEY-$(Get-Date -f HHmmss_fff)-$n.png")
-              $g.Dispose(); $bmp.Dispose()
-            } catch { L "截图失败: $_" }
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing, UIAutomationClient, UIAutomationTypes
+          Add-Type @"
+          using System; using System.Runtime.InteropServices;
+          public static class Mx {
+            [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+            [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e);
           }
+          "@
+          [void][Mx]::SetProcessDPIAware()
+          $shots = "$env:OUT\shots"; $log = "$env:OUT\logs\setup-ui.txt"
+          function L($m){ $s = "[$(Get-Date -f HH:mm:ss.fff)] $m"; Write-Host $s; Add-Content $log $s }
+          function Shot($tag){
+            try { $r = [System.Windows.Forms.SystemInformation]::VirtualScreen
+                  $b = New-Object System.Drawing.Bitmap $r.Width, $r.Height; $g = [System.Drawing.Graphics]::FromImage($b)
+                  $g.CopyFromScreen($r.Left, $r.Top, 0, 0, $b.Size)
+                  $t = ($tag -replace '[^\w\-]', '_'); if ($t.Length -gt 50) { $t = $t.Substring(0,50) }
+                  $b.Save("$shots\K_$(Get-Date -f HHmmss_fff)_$t.png", [System.Drawing.Imaging.ImageFormat]::Png)
+                  $g.Dispose(); $b.Dispose() }
+            catch { L "截图失败: $($_.Exception.Message)" } }
 
-          # 后台定时截图
-          $loop = Start-Job -ArgumentList $shots -ScriptBlock {
-            param($d)
-            Add-Type -AssemblyName System.Windows.Forms,System.Drawing
-            $i = 0
+          # ---- 后台时间线截图：每 1.5 秒一张 ----
+          $job = Start-Job -ArgumentList $shots -ScriptBlock {
+            param($d); Add-Type -AssemblyName System.Windows.Forms, System.Drawing; $i = 0
             while (-not (Test-Path "$d\STOP")) {
-              try {
-                $r = [Windows.Forms.SystemInformation]::VirtualScreen
-                $b = New-Object Drawing.Bitmap $r.Width,$r.Height
-                $g = [Drawing.Graphics]::FromImage($b)
-                $g.CopyFromScreen($r.Left,$r.Top,0,0,$b.Size)
-                $b.Save(("$d\frame-{0:D4}.jpg" -f (++$i)), [Drawing.Imaging.ImageFormat]::Jpeg)
-                $g.Dispose(); $b.Dispose()
-              } catch {}
-              Start-Sleep -Milliseconds 1500
-            }
-          }
+              try { $r = [System.Windows.Forms.SystemInformation]::VirtualScreen
+                    $b = New-Object System.Drawing.Bitmap $r.Width, $r.Height; $g = [System.Drawing.Graphics]::FromImage($b)
+                    $g.CopyFromScreen($r.Left, $r.Top, 0, 0, $b.Size)
+                    $b.Save(("$d\F_{0:D4}_{1}.jpg" -f (++$i), (Get-Date -f HHmmss)), [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                    $g.Dispose(); $b.Dispose() } catch {}
+              Start-Sleep -Milliseconds 1500 } }
 
-          $UIA = [Windows.Automation.AutomationElement]
-          $TS  = [Windows.Automation.TreeScope]
-          $CT  = [Windows.Automation.ControlType]
-          function Find($root,$type){
-            $c = New-Object Windows.Automation.PropertyCondition($UIA::ControlTypeProperty,$type)
-            @($root.FindAll($TS::Descendants,$c))
-          }
-          function PageText($w){ ((Find $w $CT::Text | % { $_.Current.Name }) -join ' | ') }
+          # ---- UI Automation 工具函数 ----
+          $AE = [System.Windows.Automation.AutomationElement]; $TS = [System.Windows.Automation.TreeScope]; $CT = [System.Windows.Automation.ControlType]
+          function Kids($el, $type){ $c = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $type); @($el.FindAll($TS::Descendants, $c)) }
+          function Names($list){ (@($list) | % { $_.Current.Name }) -join ' | ' }
+          function Pick($el){   # 选中单选/复选框；只有状态真的改变了才返回 $true
+            try { $sp = $el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($sp.Current.IsSelected) { return $false }; $sp.Select(); return $true } catch {}
+            try { $tp = $el.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); if ($tp.Current.ToggleState -eq 'On') { return $false }; $tp.Toggle(); return $true } catch {}
+            $false }
+          function Click($el, $hwnd){   # Invoke -> LegacyIAccessible -> 真实鼠标点击 三级降级
+            try { $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke(); return 'invoke' } catch {}
+            try { $el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern).DoDefaultAction(); return 'legacy' } catch {}
+            try { $rc = $el.Current.BoundingRectangle; [void][Mx]::SetForegroundWindow($hwnd)
+                  [void][Mx]::SetCursorPos([int]($rc.X + $rc.Width/2), [int]($rc.Y + $rc.Height/2)); Start-Sleep -Milliseconds 150
+                  [Mx]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [Mx]::mouse_event(4,0,0,0,[UIntPtr]::Zero); return 'mouse' } catch { return 'FAILED' } }
 
-          $procRx = '^(setup|msiexec|ISBEW64|IsUninst|jre.*|vjredist|install|dotnetfx.*|isnetfx|dpinst.*|hasp.*|Sentinel.*|Scenarist.*)$'
-          $titleRx = 'Scenarist|InstallShield|Java|J#|\.NET|Sentinel|Setup|Install'
-          $acceptRx = '(?i)I accept|accept the terms|I agree|^Yes, I'
-          $btnOrder = '(?i)^&?Next','(?i)^&?Install','(?i)^&?Finish','(?i)^&?Yes$','(?i)^OK$','(?i)^&?Continue','(?i)^&?Accept'
-          $clicked = @{}; $seen = @{}
+          $procRx  = '^(setup|setup64|msiexec|ISBEW64|IDriver|IDriver2|_isdel|ikernel|jre\w*|vjredist|install|dotnetfx20|isnetfx|dxwebsetup|dxsetup|haspdinst|sentinel\w*|scenarist\w*)$'
+          $titleRx = '(?i)Scenarist|InstallShield|Java|J#|\.NET Framework|Sentinel|HASP|Setup|Install|Program Compatibility|Security Warning|Windows Installer|Visual C\+\+'
+          function SetupWindows(){
+            $out = @()
+            foreach ($w in @($AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition))) {
+              try { $p = Get-Process -Id $w.Current.ProcessId -EA SilentlyContinue; if (-not $p) { continue }
+                    if ($p.Id -eq $PID -or $p.ProcessName -match '^(powershell|pwsh|conhost|WindowsTerminal|explorer|Runner\.\w+)$') { continue }
+                    if ($p.ProcessName -match $procRx -or $w.Current.Name -match $titleRx) {
+                      $out += ,@{ El=$w; Proc=$p.ProcessName; Title=$w.Current.Name; H=[IntPtr]$w.Current.NativeWindowHandle } } } catch {} }
+            $out }
 
-          Shot "00-desktop-before-setup"
-          $setup = Start-Process $env:SETUP -WorkingDirectory $env:PKGDIR -PassThru
-          L "已启动 setup.exe PID=$($setup.Id)"
-          $deadline = (Get-Date).AddMinutes(40); $idle = 0
+          $seen = @{}; $clicked = @{}; $warned = @{}
+          $acceptRx = '(?i)accept|agree|同意'
+          $neverRx  = '(?i)cancel|back|exit|abort|restart now|reboot now|remove|repair|modify'
+          $normalOrder = @('(?i)^&?Install', '(?i)^&?Next', '(?i)^&?Finish', '(?i)^&?Yes', '(?i)^&?OK$', '(?i)^&?Continue', '(?i)^&?Run$', '(?i)installed correctly', '(?i)^&?Close$')
+          $rebootOrder = @('(?i)^&?No$', '(?i)^&?Finish', '(?i)^&?OK$', '(?i)^&?Close$')
 
+          function Handle($w){
+            $el = $w.El; $h = $w.H
+            $texts = Names (Kids $el $CT::Text)
+            $buttons = @(Kids $el $CT::Button | ? { $_.Current.IsEnabled -and -not $_.Current.IsOffscreen })
+            $fp = "$h|$texts|$(Names $buttons)"
+            if (-not $seen.ContainsKey($fp)) { $seen[$fp] = 1
+              L "== 窗口 [$($w.Proc)] '$($w.Title)'"; L "   文本: $texts"; L "   按钮: $(Names $buttons)"
+              Shot "page_$($w.Title)" }
+            $isReboot = $texts -match '(?i)restart|reboot'
+            # 1) 许可协议
+            foreach ($r in @(Kids $el $CT::RadioButton) + @(Kids $el $CT::CheckBox)) {
+              if ($r.Current.IsEnabled -and $r.Current.Name -match $acceptRx) { if (Pick $r) { L "   选中: $($r.Current.Name)"; Start-Sleep -Milliseconds 800; return $true } } }
+            # 2) 重启提示 -> 选稍后
+            if ($isReboot) { foreach ($r in @(Kids $el $CT::RadioButton)) {
+              if ($r.Current.Name -match '(?i)later|^No') { if (Pick $r) { L "   选中(不重启): $($r.Current.Name)"; Start-Sleep -Milliseconds 800; return $true } } } }
+            # 3) Next 灰掉且有空输入框 -> 填占位值（Customer Information 页）
+            $nextAll = @(Kids $el $CT::Button | ? { $_.Current.Name -match '(?i)^&?Next' })
+            if ($nextAll.Count -gt 0 -and -not ($nextAll | ? { $_.Current.IsEnabled })) {
+              foreach ($e in @(Kids $el $CT::Edit)) { try { $vp = $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+                if (-not $vp.Current.IsReadOnly -and [string]::IsNullOrWhiteSpace($vp.Current.Value)) { $vp.SetValue('GitHubActions'); L "   填写输入框 '$($e.Current.Name)'"; Start-Sleep -Milliseconds 500; return $true } } catch {} }
+              if (-not $warned[$fp]) { $warned[$fp] = 1; L "   !! Next 不可用且无可填输入框（可能要序列号），等待..." } }
+            # 4) 按优先级点击
+            $order = if ($isReboot) { $rebootOrder } else { $normalOrder }
+            foreach ($rx in $order) {
+              $b = $buttons | ? { $_.Current.Name -match $rx -and $_.Current.Name -notmatch $neverRx } | select -First 1
+              if (-not $b) { continue }
+              $ck = "$fp|$($b.Current.Name)"
+              if ($clicked.ContainsKey($ck) -and ((Get-Date) - $clicked[$ck]).TotalSeconds -lt 10) { return $false }
+              [void][Mx]::SetForegroundWindow($h); Start-Sleep -Milliseconds 300
+              Shot "click_$($b.Current.Name)"
+              $how = Click $b $h; $clicked[$ck] = Get-Date
+              L "   点击 [$($b.Current.Name)] via $how @ '$($w.Title)'"
+              Start-Sleep 2; return $true }
+            $false }
+
+          # ---- 主流程 ----
+          Shot 'desktop_before_setup'
+          $setup = Start-Process -FilePath $env:SETUP_EXE -WorkingDirectory $env:PKG_DIR -PassThru
+          L "setup.exe 已启动 pid=$($setup.Id)  超时=$env:SETUP_TIMEOUT_MIN 分钟"
+          $deadline = (Get-Date).AddMinutes([int]$env:SETUP_TIMEOUT_MIN); $quiet = 0
           while ((Get-Date) -lt $deadline) {
-            $wins = @($UIA::RootElement.FindAll($TS::Children, [Windows.Automation.Condition]::TrueCondition) | ? {
-              $p = Get-Process -Id $_.Current.ProcessId -ErrorAction SilentlyContinue
-              $p -and ($p.ProcessName -match $procRx -or ($_.Current.Name -match $titleRx -and $p.ProcessName -notmatch 'explorer|WindowsTerminal|conhost|powershell'))
-            })
+            $wins = @(SetupWindows)
+            if ($wins.Count -eq 0) {
+              $busy = @(Get-Process -EA SilentlyContinue | ? { $_.ProcessName -match '^(setup|ISBEW64|IDriver|IDriver2)$' -or ($_.ProcessName -eq 'msiexec' -and $_.MainWindowHandle -ne 0) })
+              if ($setup.HasExited -and $busy.Count -eq 0) { if ((++$quiet) -ge 8) { L "安装进程已退出且无相关窗口，结束交互"; break } }
+            } else { $quiet = 0 }
+            $acted = $false
+            foreach ($w in $wins) { try { if (Handle $w) { $acted = $true; break } } catch { L "处理窗口异常: $($_.Exception.Message)" } }
+            if (-not $acted) { Start-Sleep 1 } }
+          if ((Get-Date) -ge $deadline) { L "!! 超时：安装仍未结束，请看最后几张截图和日志" }
+          Shot 'after_setup'
 
-            if ($wins.Count -eq 0 -and $setup.HasExited -and -not (Get-Process msiexec,ISBEW64 -ErrorAction SilentlyContinue | ? { $_.MainWindowHandle -ne 0 })) {
-              if (++$idle -ge 15) { L "安装窗口已全部消失"; break }
-            } else { $idle = 0 }
+          # ---- 安装结果 & 启动主程序 ----
+          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -EA SilentlyContinue |
+            ? DisplayName | sort DisplayName | select DisplayName, DisplayVersion, InstallLocation | Format-Table -AutoSize | Out-String -Width 300 | Out-File "$env:OUT\logs\installed-programs.txt"
+          $cands = @(Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Recurse -Filter *.exe -EA SilentlyContinue |
+                     ? { $_.FullName -match '(?i)scenarist' -and $_.Name -notmatch '(?i)unins|setup|crash|update|helper' })
+          $cands | % { L "候选主程序: $($_.FullName)" }
+          $main = $cands | sort { if ($_.Name -match '(?i)^Scenarist\s*BD') {0} elseif ($_.Name -match '(?i)^Scenarist') {1} else {2} } | select -First 1
+          if ($main) {
+            L "启动主程序: $($main.FullName)  版本 $($main.VersionInfo.FileVersion)"
+            Start-Process $main.FullName -WorkingDirectory $main.DirectoryName
+            for ($i = 1; $i -le 40; $i++) { Start-Sleep 3; Shot ("main_{0:D2}" -f $i)
+              if ($i % 10 -eq 0) { Get-Process | ? { $_.MainWindowTitle } | % { L "   窗口 [$($_.ProcessName)] $($_.MainWindowTitle)" } } }
+            foreach ($w in @($AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition))) {
+              try { if ($w.Current.Name -match '(?i)scenarist|licen|hasp|sentinel|error') { L "主程序窗口 '$($w.Current.Name)': $(Names (Kids $w $CT::Text))" } } catch {} }
+          } else { L "未找到 Scenarist 主程序 exe，安装很可能没有完成"; Shot 'no_main_exe' }
 
-            foreach ($w in $wins) {
-              try {
-                $txt = PageText $w
-                $key = "$($w.Current.NativeWindowHandle)|$txt"
-                if (-not $seen[$key]) {
-                  $seen[$key] = 1
-                  L "新页面 [$($w.Current.Name)]: $txt"
-                  L ("  按钮: " + ((Find $w $CT::Button | % { $_.Current.Name }) -join ', '))
-                  Shot "page-$($w.Current.Name)"
-                }
+          New-Item "$shots\STOP" -ItemType File -Force | Out-Null
+          Wait-Job $job -Timeout 10 | Out-Null; Remove-Job $job -Force -EA SilentlyContinue; Remove-Item "$shots\STOP" -EA SilentlyContinue
+          L "截图总数: $((Get-ChildItem $shots -File).Count)"
 
-                # 1) 勾选同意许可
-                foreach ($r in (Find $w $CT::RadioButton | ? { $_.Current.Name -match $acceptRx -and $_.Current.IsEnabled })) {
-                  $sp = $r.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern)
-                  if (-not $sp.Current.IsSelected) { $sp.Select(); L "选择: $($r.Current.Name)"; Start-Sleep 1 }
-                }
-                foreach ($c in (Find $w $CT::CheckBox | ? { $_.Current.Name -match $acceptRx -and $_.Current.IsEnabled })) {
-                  $tp = $c.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern)
-                  if ($tp.Current.ToggleState -ne 'On') { $tp.Toggle(); L "勾选: $($c.Current.Name)"; Start-Sleep 1 }
-                }
-
-                $buttons = Find $w $CT::Button | ? { $_.Current.IsEnabled }
-
-                # 2) 重启提示：只选稍后，绝不重启
-                if ($txt -match '(?i)restart|reboot') {
-                  foreach ($r in (Find $w $CT::RadioButton | ? { $_.Current.Name -match '(?i)later|No,' })) {
-                    $r.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select(); L "选择稍后重启"
-                  }
-                  $no = $buttons | ? { $_.Current.Name -match '(?i)^&?No$' } | Select -First 1
-                  if ($no) { Shot "before-No"; $no.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke(); L "点击 No（不重启）"; Start-Sleep 2; continue }
-                }
-
-                # 3) 按优先级点击推进按钮（从不点 Cancel/Back）
-                foreach ($rx in $btnOrder) {
-                  $b = $buttons | ? { $_.Current.Name -match $rx -and $_.Current.Name -notmatch '(?i)cancel|back' } | Select -First 1
-                  if (-not $b) { continue }
-                  $ck = "$key|$($b.Current.Name)"
-                  if ($clicked[$ck] -and ((Get-Date) - $clicked[$ck]).TotalSeconds -lt 12) { break }
-                  Shot "before-$($b.Current.Name)"
-                  $b.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
-                  $clicked[$ck] = Get-Date
-                  L "点击 [$($b.Current.Name)] @ [$($w.Current.Name)]"
-                  Start-Sleep 2; Shot "after-$($b.Current.Name)"
-                  break
-                }
-              } catch { L "窗口处理异常: $($_.Exception.Message)" }
-            }
-            Start-Sleep -Milliseconds 1000
-          }
-          Shot "setup-end"
-
-          # 启动主程序
-          $exe = Get-ChildItem "C:\Program Files","C:\Program Files (x86)" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-                 ? { $_.Name -match '(?i)scenarist' -and $_.Name -notmatch '(?i)unins|setup|crash' } |
-                 Sort-Object { if ($_.Name -match '(?i)^Scenarist\s*BD') {0} else {1} } | Select -First 1
-          if ($exe) {
-            L "启动主程序: $($exe.FullName)"
-            Start-Process $exe.FullName -WorkingDirectory $exe.DirectoryName
-            1..40 | % { Start-Sleep 3; Shot "main-$_" }
-            Get-Process | ? { $_.MainWindowTitle } | % { L "窗口: [$($_.ProcessName)] $($_.MainWindowTitle)" }
-          } else { L "未找到 Scenarist 主程序，安装可能失败"; Shot "no-main-exe" }
-
-          New-Item "$shots\STOP" -ItemType File | Out-Null
-          Wait-Job $loop -Timeout 10 | Out-Null; Remove-Job $loop -Force
-          Remove-Item "$shots\STOP"
-
-      - name: 上传截图和日志
+      # ------------------------------------------------------------------
+      - name: 5. 上传截图与日志（无论成败）
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: scenarist-screens-${{ github.run_number }}
-          path: out/
+          name: scenarist-bd-screenshots-${{ github.run_number }}
+          path: out
+          if-no-files-found: warn
           retention-days: 14
