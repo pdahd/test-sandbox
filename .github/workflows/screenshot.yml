@@ -1,10 +1,10 @@
-name: Scenarist BD - install & screenshot
+name: Scenarist BD - install and screenshot
 
 on:
   workflow_dispatch:
     inputs:
       setup_timeout_min:
-        description: "安装向导自动交互最长等待（分钟）"
+        description: "Max minutes to auto-drive the setup wizard"
         default: "35"
 
 env:
@@ -17,11 +17,11 @@ jobs:
     timeout-minutes: 110
     defaults:
       run:
-        shell: powershell      # 必须是 Windows PowerShell 5.1，UIAutomation 在 pwsh 7 下不稳定
+        shell: powershell   # Windows PowerShell 5.1 (UIAutomation is stable here)
 
     steps:
       # ------------------------------------------------------------------
-      - name: 1. 桌面自检、最小化 runner 黑窗口、尝试提高分辨率
+      - name: 1. Desktop check, minimize runner console, try higher resolution
         run: |
           New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\logs" | Out-Null
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -52,7 +52,7 @@ jobs:
           Write-Host "OS: $($os.Caption) | $($os.Version) | $($os.OSArchitecture)"
           Write-Host "Session: $((Get-Process -Id $PID).SessionId)  UserInteractive: $([Environment]::UserInteractive)  Explorer: $([bool](Get-Process explorer -EA SilentlyContinue))"
 
-          # 最小化 hosted-compute-agent 控制台（不要关闭！）
+          # Minimize the hosted-compute-agent console (NEVER close or kill it)
           $cb = [U32+EnumProc]{ param($h, $l)
             if ([U32]::IsWindowVisible($h)) {
               $sb = New-Object System.Text.StringBuilder 1024
@@ -63,7 +63,7 @@ jobs:
           [void][U32]::EnumWindows($cb, [IntPtr]::Zero)
           Get-Process ServerManager -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
 
-          # 尝试提高分辨率（Hyper-V 虚拟显卡不一定支持，失败就算了）
+          # Try to raise resolution (Hyper-V virtual GPU may refuse; continue anyway)
           $dm = New-Object U32+DEVMODE; $dm.dmSize = [Runtime.InteropServices.Marshal]::SizeOf($dm)
           [void][U32]::EnumDisplaySettings($null, -1, [ref]$dm)
           foreach ($res in @(@(1920,1080), @(1600,1200), @(1280,1024))) {
@@ -73,91 +73,91 @@ jobs:
           $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
           Write-Host "Screen now: $($scr.Width)x$($scr.Height)"
 
-          # 基线截图：这一步失败说明根本没有可交互桌面，早死早超生
+          # Baseline shot: if this fails there is no interactive desktop at all
           $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
           $g = [System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen(0,0,0,0,$b.Size)
           $b.Save("$env:OUT\shots\K_000000_baseline_desktop.png"); $g.Dispose(); $b.Dispose()
 
       # ------------------------------------------------------------------
-      - name: 2. 下载并解压安装包
+      - name: 2. Download and extract the package
         run: |
           $f = "$env:RUNNER_TEMP\pkg.bin"
           curl.exe -L --fail --retry 3 --retry-delay 5 -A "Mozilla/5.0" -o $f "$env:PKG_URL"
-          if ($LASTEXITCODE -ne 0) { throw "1" }
+          if ($LASTEXITCODE -ne 0) { throw "download failed (curl exit $LASTEXITCODE); the Filemail link may have expired" }
           $fi = Get-Item $f
           $fs = [IO.File]::OpenRead($f); $hb = New-Object byte[] 8; [void]$fs.Read($hb,0,8); $fs.Close()
           Write-Host "size=$($fi.Length)  magic=$(($hb | % { $_.ToString('X2') }) -join ' ')"
-          if ($fi.Length -lt 1MB) { Get-Content $f -TotalCount 20; throw "2" }
+          if ($fi.Length -lt 1MB) { Get-Content $f -TotalCount 20; throw "file too small: probably an HTML error page, not an archive" }
           & "C:\Program Files\7-Zip\7z.exe" x $f "-o$env:RUNNER_TEMP\pkg" -y | Select-Object -Last 4
-          if ($LASTEXITCODE -ne 0) { throw "3" }
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip extraction failed (exit $LASTEXITCODE)" }
           Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse | % { "{0,12}  {1}" -f $_.Length, $_.FullName } | Tee-Object "$env:OUT\logs\package-tree.txt"
           $setup = Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse -Filter setup.exe | Select-Object -First 1
-          if (-not $setup) { throw "4" }
+          if (-not $setup) { throw "setup.exe not found in archive" }
           "SETUP_EXE=$($setup.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "PKG_DIR=$($setup.DirectoryName)"  | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "setup.exe => $($setup.FullName)"
 
       # ------------------------------------------------------------------
-      - name: 3. 查询系统依赖，缺什么装什么
+      - name: 3. Query system dependencies, install what is missing
         timeout-minutes: 30
         run: |
           $log = "$env:OUT\logs\dependencies.txt"
           function L($m){ $s = "[$(Get-Date -f HH:mm:ss)] $m"; Write-Host $s; Add-Content $log $s }
           function Installed($rx){ Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -EA SilentlyContinue | ? { $_.DisplayName -match $rx } | % DisplayName }
           function Run($exe,$a,$label){
-            if (-not $exe -or -not (Test-Path $exe)) { L "$label : 安装包不存在，跳过"; return }
-            try { $p = Start-Process -FilePath $exe -ArgumentList $a -Wait -PassThru; L "$label : exit $($p.ExitCode)  (0=成功 3010=需重启 1638/5100=已存在或系统不支持)" }
-            catch { L "$label : 异常 $($_.Exception.Message)" } }
+            if (-not $exe -or -not (Test-Path $exe)) { L "$label : installer missing, skip"; return }
+            try { $p = Start-Process -FilePath $exe -ArgumentList $a -Wait -PassThru; L "$label : exit $($p.ExitCode)  (0=ok 3010=reboot needed 1638/5100=already present or unsupported)" }
+            catch { L "$label : exception $($_.Exception.Message)" } }
 
-          L "=== Windows Installer 服务 ==="
+          L "=== Windows Installer service ==="
           Start-Service msiserver -EA SilentlyContinue; L "msiserver: $((Get-Service msiserver).Status)"
 
           L "=== .NET Framework 2.0 / 3.5 (NetFx3) ==="
           $fx = Get-WindowsOptionalFeature -Online -FeatureName NetFx3
-          L "NetFx3 当前: $($fx.State)"
+          L "NetFx3 now: $($fx.State)"
           if ($fx.State -ne 'Enabled') {
-            try { $r = Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -EA Stop; L "Enable-WindowsOptionalFeature 完成, RestartNeeded=$($r.RestartNeeded)" }
-            catch { L "Enable 失败: $($_.Exception.Message)，改用 DISM"; dism.exe /Online /Enable-Feature /FeatureName:NetFx3 /All /NoRestart | Out-Null; L "dism exit $LASTEXITCODE" }
-            L "NetFx3 现在: $((Get-WindowsOptionalFeature -Online -FeatureName NetFx3).State)" }
-          L ".NET 2.0 注册表版本: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v2.0.50727' -EA SilentlyContinue).Version)"
+            try { $r = Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -EA Stop; L "Enable-WindowsOptionalFeature done, RestartNeeded=$($r.RestartNeeded)" }
+            catch { L "Enable failed: $($_.Exception.Message), fallback to DISM"; dism.exe /Online /Enable-Feature /FeatureName:NetFx3 /All /NoRestart | Out-Null; L "dism exit $LASTEXITCODE" }
+            L "NetFx3 now: $((Get-WindowsOptionalFeature -Online -FeatureName NetFx3).State)" }
+          L ".NET 2.0 registry version: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v2.0.50727' -EA SilentlyContinue).Version)"
           L ".NET 4.x Release: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -EA SilentlyContinue).Release)"
-          L "（包内 dotnetfx20.exe / isnetfx.exe 不单独运行：Server 2025 会拒绝 .NET 2.0 独立安装包，NetFx3 功能已包含 2.0 运行时）"
+          L "(dotnetfx20.exe / isnetfx.exe inside the package are NOT run separately: Server 2025 rejects standalone .NET 2.0 installers, and NetFx3 already contains the 2.0 runtime)"
 
           L "=== Visual J# 2.0 Redistributable ==="
           $vjHas = (Installed 'Visual J#') -or (Get-ChildItem "$env:windir\assembly" -Recurse -Filter vjslib.dll -EA SilentlyContinue)
-          if ($vjHas) { L "J# 已存在: $(Installed 'Visual J#')" }
+          if ($vjHas) { L "J# already present: $(Installed 'Visual J#')" }
           else { $vj = Get-ChildItem "$env:PKG_DIR\ISSetupPrerequisites" -Recurse -Filter vjredist.exe | Select -First 1
                  Run $vj.FullName '/q:a /c:"install.exe /q"' 'J# 2.0'
-                 L "J# 安装后: $(Installed 'Visual J#')" }
+                 L "J# after install: $(Installed 'Visual J#')" }
 
           L "=== Java Runtime 1.5 (32-bit) ==="
           $jreHas = (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment\1.5') -or (Installed 'J2SE Runtime Environment 5|Java\(TM\) 2 Runtime|Java 5')
-          if ($jreHas) { L "JRE 1.5 已存在" }
+          if ($jreHas) { L "JRE 1.5 already present" }
           else { $jre = Get-ChildItem "$env:PKG_DIR\ISSetupPrerequisites" -Recurse -Filter "jre-*.exe" | Select -First 1
                  Run $jre.FullName '/s /v"/qn REBOOT=Suppress"' 'JRE 1.5.0_07'
-                 L "JRE 注册表: $(Test-Path 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment\1.5')" }
+                 L "JRE registry: $(Test-Path 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment\1.5')" }
 
-          L "=== Visual C++ 运行库 ==="
-          Installed 'Visual C\+\+' | sort -Unique | % { L "  已有: $_" }
+          L "=== Visual C++ runtimes ==="
+          Installed 'Visual C\+\+' | sort -Unique | % { L "  already present: $_" }
           foreach ($a in 'x86','x64') {
             if (-not (Installed "Visual C\+\+ 2015-20\d\d.*$a")) {
               $e = "$env:RUNNER_TEMP\vc_$a.exe"; curl.exe -sL -o $e "https://aka.ms/vs/17/release/vc_redist.$a.exe"
               Run $e '/install /quiet /norestart' "VC++ 2015-2022 $a" } }
 
-          L "=== DirectX 9 旧运行库 (d3dx9) ==="
-          if (Test-Path "$env:windir\SysWOW64\d3dx9_43.dll") { L "d3dx9_43.dll 已存在" }
+          L "=== legacy DirectX 9 runtime (d3dx9) ==="
+          if (Test-Path "$env:windir\SysWOW64\d3dx9_43.dll") { L "d3dx9_43.dll already present" }
           else { $dx = "$env:RUNNER_TEMP\dxwebsetup.exe"
                  curl.exe -sL --fail -o $dx "https://download.microsoft.com/download/1/7/1/1718CCC4-6315-4D8E-9543-8E28A4E18C4C/dxwebsetup.exe"
-                 if ($LASTEXITCODE -eq 0) { Run $dx '/Q' 'DirectX End-User Runtime' } else { L "dxwebsetup 下载失败，跳过" } }
+                 if ($LASTEXITCODE -eq 0) { Run $dx '/Q' 'DirectX End-User Runtime' } else { L "dxwebsetup download failed, skip" } }
 
-          L "=== Media Foundation (Server 版默认可能未装) ==="
+          L "=== Media Foundation (may be absent on Server) ==="
           try { $mf = Get-WindowsFeature Server-Media-Foundation -EA Stop; L "Server-Media-Foundation: $($mf.InstallState)"
-                if ($mf.InstallState -ne 'Installed') { $r = Install-WindowsFeature Server-Media-Foundation -EA Stop; L "安装结果: Success=$($r.Success) Restart=$($r.RestartNeeded)" } }
-          catch { L "Media Foundation 检查失败: $($_.Exception.Message)" }
-          L "=== 依赖处理结束 ==="
+                if ($mf.InstallState -ne 'Installed') { $r = Install-WindowsFeature Server-Media-Foundation -EA Stop; L "install result: Success=$($r.Success) Restart=$($r.RestartNeeded)" } }
+          catch { L "Media Foundation check failed: $($_.Exception.Message)" }
+          L "=== dependency step finished ==="
 
       # ------------------------------------------------------------------
-      - name: 4. 运行 setup.exe，自动交互 + 全程截图，然后启动主程序
+      - name: 4. Run setup.exe, auto-drive wizard with screenshots, then launch main UI
         timeout-minutes: 60
         env:
           SETUP_TIMEOUT_MIN: ${{ inputs.setup_timeout_min || '35' }}
@@ -182,9 +182,9 @@ jobs:
                   $t = ($tag -replace '[^\w\-]', '_'); if ($t.Length -gt 50) { $t = $t.Substring(0,50) }
                   $b.Save("$shots\K_$(Get-Date -f HHmmss_fff)_$t.png", [System.Drawing.Imaging.ImageFormat]::Png)
                   $g.Dispose(); $b.Dispose() }
-            catch { L "截图失败: $($_.Exception.Message)" } }
+            catch { L "screenshot failed: $($_.Exception.Message)" } }
 
-          # ---- 后台时间线截图：每 1.5 秒一张 ----
+          # ---- background timeline capture: one full-screen shot every 1.5 s ----
           $job = Start-Job -ArgumentList $shots -ScriptBlock {
             param($d); Add-Type -AssemblyName System.Windows.Forms, System.Drawing; $i = 0
             while (-not (Test-Path "$d\STOP")) {
@@ -195,15 +195,15 @@ jobs:
                     $g.Dispose(); $b.Dispose() } catch {}
               Start-Sleep -Milliseconds 1500 } }
 
-          # ---- UI Automation 工具函数 ----
+          # ---- UI Automation helpers ----
           $AE = [System.Windows.Automation.AutomationElement]; $TS = [System.Windows.Automation.TreeScope]; $CT = [System.Windows.Automation.ControlType]
           function Kids($el, $type){ $c = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $type); @($el.FindAll($TS::Descendants, $c)) }
           function Names($list){ (@($list) | % { $_.Current.Name }) -join ' | ' }
-          function Pick($el){   # 选中单选/复选框；只有状态真的改变了才返回 $true
+          function Pick($el){   # select radio / check; only returns $true when state really changed
             try { $sp = $el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($sp.Current.IsSelected) { return $false }; $sp.Select(); return $true } catch {}
             try { $tp = $el.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); if ($tp.Current.ToggleState -eq 'On') { return $false }; $tp.Toggle(); return $true } catch {}
             $false }
-          function Click($el, $hwnd){   # Invoke -> LegacyIAccessible -> 真实鼠标点击 三级降级
+          function Click($el, $hwnd){   # Invoke -> LegacyIAccessible -> real mouse click
             try { $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke(); return 'invoke' } catch {}
             try { $el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern).DoDefaultAction(); return 'legacy' } catch {}
             try { $rc = $el.Current.BoundingRectangle; [void][Mx]::SetForegroundWindow($hwnd)
@@ -222,7 +222,7 @@ jobs:
             $out }
 
           $seen = @{}; $clicked = @{}; $warned = @{}
-          $acceptRx = '(?i)accept|agree|同意'
+          $acceptRx = '(?i)accept|agree'
           $neverRx  = '(?i)cancel|back|exit|abort|restart now|reboot now|remove|repair|modify'
           $normalOrder = @('(?i)^&?Install', '(?i)^&?Next', '(?i)^&?Finish', '(?i)^&?Yes', '(?i)^&?OK$', '(?i)^&?Continue', '(?i)^&?Run$', '(?i)installed correctly', '(?i)^&?Close$')
           $rebootOrder = @('(?i)^&?No$', '(?i)^&?Finish', '(?i)^&?OK$', '(?i)^&?Close$')
@@ -233,22 +233,22 @@ jobs:
             $buttons = @(Kids $el $CT::Button | ? { $_.Current.IsEnabled -and -not $_.Current.IsOffscreen })
             $fp = "$h|$texts|$(Names $buttons)"
             if (-not $seen.ContainsKey($fp)) { $seen[$fp] = 1
-              L "== 窗口 [$($w.Proc)] '$($w.Title)'"; L "   文本: $texts"; L "   按钮: $(Names $buttons)"
+              L "== window [$($w.Proc)] '$($w.Title)'"; L "   text: $texts"; L "   buttons: $(Names $buttons)"
               Shot "page_$($w.Title)" }
             $isReboot = $texts -match '(?i)restart|reboot'
-            # 1) 许可协议
+            # 1) license agreement
             foreach ($r in @(Kids $el $CT::RadioButton) + @(Kids $el $CT::CheckBox)) {
-              if ($r.Current.IsEnabled -and $r.Current.Name -match $acceptRx) { if (Pick $r) { L "   选中: $($r.Current.Name)"; Start-Sleep -Milliseconds 800; return $true } } }
-            # 2) 重启提示 -> 选稍后
+              if ($r.Current.IsEnabled -and $r.Current.Name -match $acceptRx) { if (Pick $r) { L "   selected: $($r.Current.Name)"; Start-Sleep -Milliseconds 800; return $true } } }
+            # 2) reboot prompt -> choose later
             if ($isReboot) { foreach ($r in @(Kids $el $CT::RadioButton)) {
-              if ($r.Current.Name -match '(?i)later|^No') { if (Pick $r) { L "   选中(不重启): $($r.Current.Name)"; Start-Sleep -Milliseconds 800; return $true } } } }
-            # 3) Next 灰掉且有空输入框 -> 填占位值（Customer Information 页）
+              if ($r.Current.Name -match '(?i)later|^No') { if (Pick $r) { L "   selected (no reboot): $($r.Current.Name)"; Start-Sleep -Milliseconds 800; return $true } } } }
+            # 3) Next disabled and an empty input box -> fill placeholder (Customer Information page)
             $nextAll = @(Kids $el $CT::Button | ? { $_.Current.Name -match '(?i)^&?Next' })
             if ($nextAll.Count -gt 0 -and -not ($nextAll | ? { $_.Current.IsEnabled })) {
               foreach ($e in @(Kids $el $CT::Edit)) { try { $vp = $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-                if (-not $vp.Current.IsReadOnly -and [string]::IsNullOrWhiteSpace($vp.Current.Value)) { $vp.SetValue('GitHubActions'); L "   填写输入框 '$($e.Current.Name)'"; Start-Sleep -Milliseconds 500; return $true } } catch {} }
-              if (-not $warned[$fp]) { $warned[$fp] = 1; L "   !! Next 不可用且无可填输入框（可能要序列号），等待..." } }
-            # 4) 按优先级点击
+                if (-not $vp.Current.IsReadOnly -and [string]::IsNullOrWhiteSpace($vp.Current.Value)) { $vp.SetValue('GitHubActions'); L "   filled input '$($e.Current.Name)'"; Start-Sleep -Milliseconds 500; return $true } } catch {} }
+              if (-not $warned[$fp]) { $warned[$fp] = 1; L "   !! Next is disabled and there is no fillable input (maybe a serial is required); waiting..." } }
+            # 4) click by priority
             $order = if ($isReboot) { $rebootOrder } else { $normalOrder }
             foreach ($rx in $order) {
               $b = $buttons | ? { $_.Current.Name -match $rx -and $_.Current.Name -notmatch $neverRx } | select -First 1
@@ -258,53 +258,52 @@ jobs:
               [void][Mx]::SetForegroundWindow($h); Start-Sleep -Milliseconds 300
               Shot "click_$($b.Current.Name)"
               $how = Click $b $h; $clicked[$ck] = Get-Date
-              L "   点击 [$($b.Current.Name)] via $how @ '$($w.Title)'"
+              L "   clicked [$($b.Current.Name)] via $how @ '$($w.Title)'"
               Start-Sleep 2; return $true }
             $false }
 
-          # ---- 主流程 ----
+          # ---- main flow ----
           Shot 'desktop_before_setup'
           $setup = Start-Process -FilePath $env:SETUP_EXE -WorkingDirectory $env:PKG_DIR -PassThru
-          L "setup.exe 已启动 pid=$($setup.Id)  超时=$env:SETUP_TIMEOUT_MIN 分钟"
+          L "setup.exe started pid=$($setup.Id)  timeout=$env:SETUP_TIMEOUT_MIN min"
           $deadline = (Get-Date).AddMinutes([int]$env:SETUP_TIMEOUT_MIN); $quiet = 0
           while ((Get-Date) -lt $deadline) {
             $wins = @(SetupWindows)
             if ($wins.Count -eq 0) {
               $busy = @(Get-Process -EA SilentlyContinue | ? { $_.ProcessName -match '^(setup|ISBEW64|IDriver|IDriver2)$' -or ($_.ProcessName -eq 'msiexec' -and $_.MainWindowHandle -ne 0) })
-              if ($setup.HasExited -and $busy.Count -eq 0) { if ((++$quiet) -ge 8) { L "安装进程已退出且无相关窗口，结束交互"; break } }
+              if ($setup.HasExited -and $busy.Count -eq 0) { if ((++$quiet) -ge 8) { L "setup process exited and no related window remains; ending interaction"; break } }
             } else { $quiet = 0 }
             $acted = $false
-            foreach ($w in $wins) { try { if (Handle $w) { $acted = $true; break } } catch { L "处理窗口异常: $($_.Exception.Message)" } }
+            foreach ($w in $wins) { try { if (Handle $w) { $acted = $true; break } } catch { L "window handling exception: $($_.Exception.Message)" } }
             if (-not $acted) { Start-Sleep 1 } }
-          if ((Get-Date) -ge $deadline) { L "!! 超时：安装仍未结束，请看最后几张截图和日志" }
+          if ((Get-Date) -ge $deadline) { L "!! timeout: setup still not finished, inspect the last screenshots and the log" }
           Shot 'after_setup'
 
-          # ---- 安装结果 & 启动主程序 ----
+          # ---- install result & launch main program ----
           Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -EA SilentlyContinue |
             ? DisplayName | sort DisplayName | select DisplayName, DisplayVersion, InstallLocation | Format-Table -AutoSize | Out-String -Width 300 | Out-File "$env:OUT\logs\installed-programs.txt"
           $cands = @(Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Recurse -Filter *.exe -EA SilentlyContinue |
                      ? { $_.FullName -match '(?i)scenarist' -and $_.Name -notmatch '(?i)unins|setup|crash|update|helper' })
-          $cands | % { L "候选主程序: $($_.FullName)" }
+          $cands | % { L "candidate main exe: $($_.FullName)" }
           $main = $cands | sort { if ($_.Name -match '(?i)^Scenarist\s*BD') {0} elseif ($_.Name -match '(?i)^Scenarist') {1} else {2} } | select -First 1
           if ($main) {
-            L "启动主程序: $($main.FullName)  版本 $($main.VersionInfo.FileVersion)"
+            L "launching main program: $($main.FullName)  version $($main.VersionInfo.FileVersion)"
             Start-Process $main.FullName -WorkingDirectory $main.DirectoryName
             for ($i = 1; $i -le 40; $i++) { Start-Sleep 3; Shot ("main_{0:D2}" -f $i)
-              if ($i % 10 -eq 0) { Get-Process | ? { $_.MainWindowTitle } | % { L "   窗口 [$($_.ProcessName)] $($_.MainWindowTitle)" } } }
+              if ($i % 10 -eq 0) { Get-Process | ? { $_.MainWindowTitle } | % { L "   window [$($_.ProcessName)] $($_.MainWindowTitle)" } } }
             foreach ($w in @($AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition))) {
-              try { if ($w.Current.Name -match '(?i)scenarist|licen|hasp|sentinel|error') { L "主程序窗口 '$($w.Current.Name)': $(Names (Kids $w $CT::Text))" } } catch {} }
-          } else { L "未找到 Scenarist 主程序 exe，安装很可能没有完成"; Shot 'no_main_exe' }
+              try { if ($w.Current.Name -match '(?i)scenarist|licen|hasp|sentinel|error') { L "main-program window '$($w.Current.Name)': $(Names (Kids $w $CT::Text))" } } catch {} }
+          } else { L "Scenarist main exe not found; installation probably did not complete"; Shot 'no_main_exe' }
 
           New-Item "$shots\STOP" -ItemType File -Force | Out-Null
           Wait-Job $job -Timeout 10 | Out-Null; Remove-Job $job -Force -EA SilentlyContinue; Remove-Item "$shots\STOP" -EA SilentlyContinue
-          L "截图总数: $((Get-ChildItem $shots -File).Count)"
+          L "total screenshots: $((Get-ChildItem $shots -File).Count)"
 
       # ------------------------------------------------------------------
-      - name: 5. 上传截图与日志（无论成败）
+      - name: 5. Upload screenshots and logs (always run)
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: scenarist-bd-screenshots-${{ github.run_number }}
           path: out
           if-no-files-found: warn
-          retention-days: 14
