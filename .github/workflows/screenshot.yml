@@ -63,7 +63,7 @@ jobs:
           [void][U32]::EnumWindows($cb, [IntPtr]::Zero)
           Get-Process ServerManager -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
 
-          # Try to raise the resolution.
+          # Try to raise the resolution. The Hyper-V virtual GPU may reject it.
           $dm = New-Object U32+DEVMODE; $dm.dmSize = [Runtime.InteropServices.Marshal]::SizeOf($dm)
           [void][U32]::EnumDisplaySettings($null, -1, [ref]$dm)
           foreach ($res in @(@(1920,1080), @(1600,1200), @(1280,1024))) {
@@ -73,7 +73,7 @@ jobs:
           $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
           Write-Host "Screen now: $($scr.Width)x$($scr.Height)"
 
-          # Baseline screenshot
+          # Baseline screenshot. Failure here means there is no interactive desktop.
           $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
           $g = [System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen(0,0,0,0,$b.Size)
           $b.Save("$env:OUT\shots\K_000000_baseline_desktop.png"); $g.Dispose(); $b.Dispose()
@@ -121,6 +121,7 @@ jobs:
             L "NetFx3 now: $((Get-WindowsOptionalFeature -Online -FeatureName NetFx3).State)" }
           L ".NET 2.0 registry version: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v2.0.50727' -EA SilentlyContinue).Version)"
           L ".NET 4.x Release: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -EA SilentlyContinue).Release)"
+          L "(dotnetfx20.exe / isnetfx.exe inside the package are not run separately: Server 2025 rejects standalone .NET 2.0 installers, and NetFx3 already includes the 2.0 runtime)"
 
           L "=== Visual J# 2.0 Redistributable ==="
           $vjHas = (Installed 'Visual J#') -or (Get-ChildItem "$env:windir\assembly" -Recurse -Filter vjslib.dll -EA SilentlyContinue)
@@ -149,7 +150,7 @@ jobs:
                  curl.exe -sL --fail -o $dx "https://download.microsoft.com/download/1/7/1/1718CCC4-6315-4D8E-9543-8E28A4E18C4C/dxwebsetup.exe"
                  if ($LASTEXITCODE -eq 0) { Run $dx '/Q' 'DirectX End-User Runtime' } else { L "dxwebsetup download failed, skip" } }
 
-          L "=== Media Foundation ==="
+          L "=== Media Foundation (may not be installed on Server edition) ==="
           try { $mf = Get-WindowsFeature Server-Media-Foundation -EA Stop; L "Server-Media-Foundation: $($mf.InstallState)"
                 if ($mf.InstallState -ne 'Installed') { $r = Install-WindowsFeature Server-Media-Foundation -EA Stop; L "Installation result: Success=$($r.Success) Restart=$($r.RestartNeeded)" } }
           catch { L "Media Foundation check failed: $($_.Exception.Message)" }
@@ -168,60 +169,90 @@ jobs:
           using System.Collections.Generic;
           using System.Runtime.InteropServices;
 
-          public static class NativeWin {
-            public delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
+          public class CtlInfo {
+            public IntPtr Hwnd;
+            public string ClassName;
+            public string Text;
+            public bool Enabled;
+            public bool Visible;
+            public int Left, Top, Right, Bottom;
+          }
+
+          public static class WinApi {
+            public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+            public const uint BM_CLICK = 0x00F5;
+            public const int SW_RESTORE = 9;
 
             [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+            [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr l);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+            [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+            [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+            [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+            [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
+            [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
             [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-            [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
-            [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-            [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
-            [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hWndParent, EnumChildProc lpEnumFunc, IntPtr lParam);
-            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-            [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr hWnd);
-            [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-            [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+            [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e);
+            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
 
-            [StructLayout(LayoutKind.Sequential)]
-            public struct RECT { public int Left, Top, Right, Bottom; }
+            public static List<CtlInfo> Top = new List<CtlInfo>();
+            public static List<CtlInfo> Kids = new List<CtlInfo>();
 
-            public const uint BM_CLICK = 0x00F5;
-            public const uint WM_COMMAND = 0x0111;
-            public const uint BM_SETCHECK = 0x00F1;
-            public const int BST_CHECKED = 1;
+            static string T(IntPtr h) { StringBuilder sb = new StringBuilder(512); GetWindowText(h, sb, 512); return sb.ToString(); }
+            static string C(IntPtr h) { StringBuilder sb = new StringBuilder(256); GetClassName(h, sb, 256); return sb.ToString(); }
 
-            public class ChildInfo {
-              public IntPtr Handle;
-              public string ClassName;
-              public string Text;
-              public bool Enabled;
-              public bool Visible;
+            static CtlInfo Mk(IntPtr h) {
+              RECT r; GetWindowRect(h, out r);
+              CtlInfo c = new CtlInfo();
+              c.Hwnd = h; c.ClassName = C(h); c.Text = T(h);
+              c.Enabled = IsWindowEnabled(h); c.Visible = IsWindowVisible(h);
+              c.Left = r.Left; c.Top = r.Top; c.Right = r.Right; c.Bottom = r.Bottom;
+              return c;
             }
 
-            public static List<ChildInfo> GetAllChildren(IntPtr parent) {
-              List<ChildInfo> list = new List<ChildInfo>();
-              EnumChildWindows(parent, (h, l) => {
-                StringBuilder sbText = new StringBuilder(512);
-                GetWindowText(h, sbText, 512);
-                StringBuilder sbClass = new StringBuilder(256);
-                GetClassName(h, sbClass, 256);
-                list.Add(new ChildInfo {
-                  Handle = h,
-                  ClassName = sbClass.ToString(),
-                  Text = sbText.ToString(),
-                  Enabled = IsWindowEnabled(h),
-                  Visible = IsWindowVisible(h)
-                });
-                return true;
-              }, IntPtr.Zero);
-              return list;
+            public static void ScanTop() {
+              Top.Clear();
+              EnumWindows((h, l) => { if (IsWindowVisible(h)) Top.Add(Mk(h)); return true; }, IntPtr.Zero);
+            }
+
+            public static void ScanKids(IntPtr parent) {
+              Kids.Clear();
+              EnumChildWindows(parent, (h, l) => { Kids.Add(Mk(h)); return true; }, IntPtr.Zero);
+            }
+
+            public static void Foreground(IntPtr h) {
+              uint dummy;
+              uint fore = GetWindowThreadProcessId(GetForegroundWindow(), out dummy);
+              uint self = GetCurrentThreadId();
+              if (fore != self) AttachThreadInput(fore, self, true);
+              ShowWindow(h, SW_RESTORE);
+              BringWindowToTop(h);
+              SetForegroundWindow(h);
+              if (fore != self) AttachThreadInput(fore, self, false);
+            }
+
+            public static void Click(IntPtr h) {
+              SendMessage(h, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+            }
+
+            public static void MouseClick(IntPtr h) {
+              RECT r; GetWindowRect(h, out r);
+              SetCursorPos((r.Left + r.Right) / 2, (r.Top + r.Bottom) / 2);
+              mouse_event(2, 0, 0, 0, UIntPtr.Zero);
+              mouse_event(4, 0, 0, 0, UIntPtr.Zero);
             }
           }
           "@
-          [void][NativeWin]::SetProcessDPIAware()
+          [void][WinApi]::SetProcessDPIAware()
+
           $shots = "$env:OUT\shots"; $log = "$env:OUT\logs\setup-ui.txt"
           function L($m){ $s = "[$(Get-Date -f HH:mm:ss.fff)] $m"; Write-Host $s; Add-Content $log $s }
           function Shot($tag){
@@ -233,7 +264,7 @@ jobs:
                   $g.Dispose(); $b.Dispose() }
             catch { L "screenshot failed: $($_.Exception.Message)" } }
 
-          # ---- Background timeline screenshots: one image every 1.5 seconds ----
+          # Background timeline screenshots every 1.5 s
           $job = Start-Job -ArgumentList $shots -ScriptBlock {
             param($d); Add-Type -AssemblyName System.Windows.Forms, System.Drawing; $i = 0
             while (-not (Test-Path "$d\STOP")) {
@@ -244,201 +275,207 @@ jobs:
                     $g.Dispose(); $b.Dispose() } catch {}
               Start-Sleep -Milliseconds 1500 } }
 
-          # ---- Window & Control Finders ----
           $AE = [System.Windows.Automation.AutomationElement]; $TS = [System.Windows.Automation.TreeScope]; $CT = [System.Windows.Automation.ControlType]
-
-          $procRx  = '^(setup|setup64|msiexec|ISBEW64|IDriver|IDriver2|_isdel|ikernel|jre\w*|vjredist|install|dotnetfx20|isnetfx|dxwebsetup|dxsetup|haspdinst|sentinel\w*|scenarist\w*)$'
-          $titleRx = '(?i)Scenarist|InstallShield|Java|J#|\.NET Framework|Sentinel|HASP|Setup|Install|Program Compatibility|Security Warning|Windows Installer|Visual C\+\+'
-
-          function SetupWindows(){
-            $out = @()
-            foreach ($w in @($AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition))) {
-              try { $p = Get-Process -Id $w.Current.ProcessId -EA SilentlyContinue; if (-not $p) { continue }
-                    if ($p.Id -eq $PID -or $p.ProcessName -match '^(powershell|pwsh|conhost|WindowsTerminal|explorer|Runner\.\w+)$') { continue }
-                    if ($p.ProcessName -match $procRx -or $w.Current.Name -match $titleRx) {
-                      $out += ,@{ El=$w; Proc=$p.ProcessName; Title=$w.Current.Name; H=[IntPtr]$w.Current.NativeWindowHandle } } } catch {} }
-            $out }
-
-          $seen = @{}; $clicked = @{}; $warned = @{}
-          $acceptRx = '(?i)accept|agree|\u540c\u610f'
-          $neverRx  = '(?i)cancel|back|exit|abort|restart now|reboot now|remove|repair|modify'
-          $normalOrder = @('(?i)^&?Install', '(?i)^&?Next', '(?i)^&?Finish', '(?i)^&?Yes', '(?i)^&?OK$', '(?i)^&?Continue', '(?i)^&?Run$', '(?i)installed correctly', '(?i)^&?Close$')
-          $rebootOrder = @('(?i)^&?No$', '(?i)^&?Finish', '(?i)^&?OK$', '(?i)^&?Close$')
-
           $wshell = New-Object -ComObject WScript.Shell
 
-          function Handle($w){
-            $el = $w.El; $h = $w.H
-            [void][NativeWin]::SetForegroundWindow($h)
-            [void][NativeWin]::ShowWindow($h, 9)
+          $titleRx = '(?i)Scenarist|InstallShield|Java|J#|\.NET Framework|Sentinel|HASP|Setup|Install|Program Compatibility|Security Warning|Windows Installer|Visual C\+\+'
+          $neverRx = '(?i)cancel|back|exit|abort|restart now|reboot now|remove|repair|modify'
+          $acceptRx = '(?i)I accept|accept the terms|agree to the terms'
+          $normalOrder = @('(?i)^&?Install', '(?i)^&?Next', '(?i)^&?Finish', '(?i)^&?Yes', '(?i)^&?OK$', '(?i)^&?Continue', '(?i)^&?Run$', '(?i)installed correctly', '(?i)^&?Close$')
+          $rebootOrder = @('(?i)later', '(?i)^&?No$', '(?i)^&?Finish', '(?i)^&?OK$', '(?i)^&?Close$')
 
-            # Get all Win32 native children for robust fallback
-            $nativeChildren = [NativeWin]::GetAllChildren($h)
-            $childTexts = ($nativeChildren | Where-Object { $_.Text } | ForEach-Object { $_.Text }) -join ' | '
-            $childButtons = @($nativeChildren | Where-Object { $_.ClassName -match '(?i)button' })
+          $seen = @{}; $clicked = @{}; $warned = @{}
 
-            $fp = "$h|$childTexts"
+          function Get-WizardWindows {
+            [WinApi]::ScanTop()
+            $list = @()
+            foreach ($t in [WinApi]::Top) {
+              if (-not $t.Text) { continue }
+              if ($t.Text -match 'ProgramData\\GitHub|hosted-compute|Runner\.Listener') { continue }
+              if ($t.Text -match $titleRx) { $list += $t }
+            }
+            $list | Sort-Object @{ Expression = {
+              if ($_.Text -eq 'Scenarist BD') { 0 }
+              elseif ($_.ClassName -eq '#32770') { 1 }
+              elseif ($_.Text -match 'InstallShield Wizard') { 3 }
+              else { 2 }
+            } }
+          }
+
+          function Handle-Wizard($top) {
+            $h = $top.Hwnd
+            [WinApi]::Foreground($h)
+            Start-Sleep -Milliseconds 250
+            [WinApi]::ScanKids($h)
+            $kids = @([WinApi]::Kids)
+            $buttons = @($kids | Where-Object { $_.ClassName -match '(?i)^button$' })
+            $texts = (($kids | Where-Object { $_.Text } | ForEach-Object { $_.Text }) -join ' | ')
+            $btnSummary = (($buttons | ForEach-Object { '{0}[en={1}]' -f $_.Text, $_.Enabled }) -join ' | ')
+            $fp = '{0}|{1}|{2}' -f $h, $texts, $btnSummary
+
             if (-not $seen.ContainsKey($fp)) {
               $seen[$fp] = 1
-              $btnSummary = ($childButtons | ForEach-Object { "$($_.Text)(Enabled=$($_.Enabled))" }) -join ', '
-              L "== window [$($w.Proc)] '$($w.Title)'"
-              L "   win32 texts: $childTexts"
-              L "   win32 buttons: $btnSummary"
-              Shot "page_$($w.Title)"
+              L ("== win32 window class={0} title='{1}' kids={2}" -f $top.ClassName, $top.Text, $kids.Count)
+              L ("   texts: {0}" -f $texts)
+              L ("   buttons: {0}" -f $btnSummary)
+              Shot ("page_" + $top.Text)
             }
 
-            $isReboot = $childTexts -match '(?i)restart|reboot'
+            $isReboot = $texts -match '(?i)restart|reboot'
+            $order = if ($isReboot) { $rebootOrder } else { $normalOrder }
 
-            # 1) Accept license agreement (Win32 radio / checkbox / UIA)
-            foreach ($cb in $childButtons) {
-              if ($cb.Enabled -and $cb.Text -match $acceptRx) {
-                L "   selecting license agreement via Win32 BM_CLICK: $($cb.Text)"
-                [void][NativeWin]::SendMessage($cb.Handle, [NativeWin]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+            # 1) License agreement: select "I accept" radio button first
+            foreach ($k in $buttons) {
+              if ($k.Enabled -and $k.Text -match $acceptRx) {
+                L ("   selecting license accept radio: '{0}'" -f $k.Text)
+                [WinApi]::Foreground($h)
+                [WinApi]::Click($k.Hwnd)
                 Start-Sleep -Milliseconds 800
+                # re-scan so Next enablement is picked up on the next loop
+                [WinApi]::ScanKids($h)
                 return $true
               }
             }
 
-            # 2) Reboot prompt -> choose later (No / Later)
+            # 2) Reboot prompt: choose No / Later, never reboot
             if ($isReboot) {
-              foreach ($cb in $childButtons) {
-                if ($cb.Enabled -and $cb.Text -match '(?i)later|^&?No') {
-                  L "   selecting no-reboot option: $($cb.Text)"
-                  [void][NativeWin]::SendMessage($cb.Handle, [NativeWin]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+              foreach ($k in $buttons) {
+                if ($k.Enabled -and $k.Text -match '(?i)later|^&?No$') {
+                  L ("   selecting no-reboot: '{0}'" -f $k.Text)
+                  [WinApi]::Foreground($h)
+                  [WinApi]::Click($k.Hwnd)
                   Start-Sleep -Milliseconds 800
                   return $true
                 }
               }
             }
 
-            # 3) Check if Next is disabled and fill input box (e.g. Customer Info)
-            $nextBtn = $childButtons | Where-Object { $_.Text -match '(?i)^&?Next' } | Select-Object -First 1
+            # 3) Next disabled: fill empty edit boxes with placeholder
+            $nextBtn = $buttons | Where-Object { $_.Text -match '(?i)^&?Next' } | Select-Object -First 1
             if ($nextBtn -and -not $nextBtn.Enabled) {
-              $editBoxes = @($nativeChildren | Where-Object { $_.ClassName -match '(?i)edit' -and $_.Enabled })
-              foreach ($eb in $editBoxes) {
-                if ([string]::IsNullOrWhiteSpace($eb.Text)) {
-                  [void][NativeWin]::SetForegroundWindow($eb.Handle)
-                  $wshell.SendKeys("GitHubUser{TAB}")
-                  L "   filled empty edit box via SendKeys"
+              $edits = @($kids | Where-Object { $_.ClassName -match '(?i)edit' -and $_.Enabled })
+              foreach ($e in $edits) {
+                if ([string]::IsNullOrWhiteSpace($e.Text)) {
+                  [WinApi]::Foreground($h)
+                  [WinApi]::MouseClick($e.Hwnd)
+                  Start-Sleep -Milliseconds 200
+                  $wshell.SendKeys('GitHubActions')
+                  L '   filled empty edit box via SendKeys'
                   Start-Sleep -Milliseconds 500
                   return $true
                 }
               }
-            }
-
-            # 4) Click button via Win32 SendMessage BM_CLICK
-            $order = if ($isReboot) { $rebootOrder } else { $normalOrder }
-            foreach ($rx in $order) {
-              $matched = $childButtons | Where-Object { $_.Text -match $rx -and $_.Text -notmatch $neverRx } | Select-Object -First 1
-              if ($matched -and $matched.Enabled) {
-                $ck = "$fp|$($matched.Text)"
-                if ($clicked.ContainsKey($ck) -and ((Get-Date) - $clicked[$ck]).TotalSeconds -lt 6) { continue }
-                [void][NativeWin]::SetForegroundWindow($h)
-                Start-Sleep -Milliseconds 200
-                Shot "click_$($matched.Text)"
-                [void][NativeWin]::SendMessage($matched.Handle, [NativeWin]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
-                $clicked[$ck] = Get-Date
-                L "   clicked [$($matched.Text)] via Win32 BM_CLICK @ '$($w.Title)'"
-                Start-Sleep 2
-                return $true
+              if (-not $warned[$fp]) {
+                $warned[$fp] = 1
+                L '   !! Next is disabled and no empty edit box found (serial may be required)'
               }
             }
 
-            # 5) UIA Fallback Click (if Win32 button not triggered)
+            # 4) Click buttons by priority via Win32 BM_CLICK
+            foreach ($rx in $order) {
+              $b = $buttons | Where-Object { $_.Enabled -and $_.Text -match $rx -and $_.Text -notmatch $neverRx } | Select-Object -First 1
+              if (-not $b) { continue }
+              $ck = '{0}|{1}' -f $fp, $b.Text
+              if ($clicked.ContainsKey($ck) -and ((Get-Date) - $clicked[$ck]).TotalSeconds -lt 8) { continue }
+              [WinApi]::Foreground($h)
+              Shot ('click_' + $b.Text)
+              [WinApi]::Click($b.Hwnd)
+              $clicked[$ck] = Get-Date
+              L ("   clicked [{0}] via BM_CLICK @ '{1}'" -f $b.Text, $top.Text)
+              Start-Sleep 2
+              return $true
+            }
+
+            # 5) UIA fallback (no IsOffscreen filter this time)
             try {
-              $c = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $CT::Button)
-              $uiaButtons = @($el.FindAll($TS::Descendants, $c))
-              foreach ($rx in $order) {
-                $ub = $uiaButtons | Where-Object { $_.Current.Name -match $rx -and $_.Current.Name -notmatch $neverRx -and $_.Current.IsEnabled } | Select-Object -First 1
-                if ($ub) {
-                  $ck = "$fp|$($ub.Current.Name)"
-                  if ($clicked.ContainsKey($ck) -and ((Get-Date) - $clicked[$ck]).TotalSeconds -lt 6) { continue }
-                  [void][NativeWin]::SetForegroundWindow($h)
-                  Shot "uia_click_$($ub.Current.Name)"
+              $el = [System.Windows.Automation.AutomationElement]::FromHandle($h)
+              if ($el) {
+                $cond = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $CT::Button)
+                $uiaBtns = @($el.FindAll($TS::Descendants, $cond))
+                foreach ($rx in $order) {
+                  $ub = $uiaBtns | Where-Object { $_.Current.IsEnabled -and $_.Current.Name -match $rx -and $_.Current.Name -notmatch $neverRx } | Select-Object -First 1
+                  if (-not $ub) { continue }
+                  $ck = '{0}|uia|{1}' -f $fp, $ub.Current.Name
+                  if ($clicked.ContainsKey($ck) -and ((Get-Date) - $clicked[$ck]).TotalSeconds -lt 8) { continue }
+                  [WinApi]::Foreground($h)
+                  Shot ('uia_click_' + $ub.Current.Name)
                   try {
                     $ub.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-                    $clicked[$ck] = Get-Date
-                    L "   clicked [$($ub.Current.Name)] via UIA Invoke @ '$($w.Title)'"
-                    Start-Sleep 2
-                    return $true
-                  } catch {}
+                  } catch {
+                    $rc = $ub.Current.BoundingRectangle
+                    [WinApi]::MouseClickByPoint([int]($rc.X + $rc.Width/2), [int]($rc.Y + $rc.Height/2))
+                  }
+                  $clicked[$ck] = Get-Date
+                  L ("   clicked [{0}] via UIA @ '{1}'" -f $ub.Current.Name, $top.Text)
+                  Start-Sleep 2
+                  return $true
                 }
               }
             } catch {}
 
-            $false
+            return $false
           }
 
-          # ---- Main flow ----
+          # Main flow
           Shot 'desktop_before_setup'
           $setup = Start-Process -FilePath $env:SETUP_EXE -WorkingDirectory $env:PKG_DIR -PassThru
-          L "setup.exe started pid=$($setup.Id)  timeout=$env:SETUP_TIMEOUT_MIN minutes"
-          $deadline = (Get-Date).AddMinutes([int]$env:SETUP_TIMEOUT_MIN); $quiet = 0
-          $stallCount = 0
+          L ("setup.exe started pid={0}  timeout={1} minutes" -f $setup.Id, $env:SETUP_TIMEOUT_MIN)
+          $deadline = (Get-Date).AddMinutes([int]$env:SETUP_TIMEOUT_MIN)
+          $quiet = 0
+          $idle = 0
 
           while ((Get-Date) -lt $deadline) {
-            $wins = @(SetupWindows)
+            $wins = @(Get-WizardWindows)
             if ($wins.Count -eq 0) {
-              $busy = @(Get-Process -EA SilentlyContinue | ? { $_.ProcessName -match '^(setup|ISBEW64|IDriver|IDriver2)$' -or ($_.ProcessName -eq 'msiexec' -and $_.MainWindowHandle -ne 0) })
+              $busy = @(Get-Process -EA SilentlyContinue | Where-Object {
+                $_.ProcessName -match '^(setup|ISBEW64|IDriver|IDriver2)$' -or ($_.ProcessName -eq 'msiexec' -and $_.MainWindowHandle -ne 0)
+              })
               if ($setup.HasExited -and $busy.Count -eq 0) {
-                if ((++$quiet) -ge 8) { L "setup process has exited and no related window remains; ending interaction"; break }
-              }
-            } else { $quiet = 0 }
+                if ((++$quiet) -ge 8) { L 'setup process has exited and no related window remains; ending interaction'; break }
+              } else { $quiet = 0 }
+              Start-Sleep 1
+              continue
+            }
+            $quiet = 0
 
             $acted = $false
             foreach ($w in $wins) {
               try {
-                if (Handle $w) { $acted = $true; $stallCount = 0; break }
-              } catch { L "window handling exception: $($_.Exception.Message)" }
+                if (Handle-Wizard $w) { $acted = $true; $idle = 0; break }
+              } catch { L ("window handling exception: {0}" -f $_.Exception.Message) }
             }
 
-            # Keyboard Shortcut Fallback if stalled on the same screen
-            if (-not $acted -and $wins.Count -gt 0) {
-              $stallCount++
-              if ($stallCount -ge 4) {
-                $targetWin = $wins[0]
-                [void][NativeWin]::SetForegroundWindow($targetWin.H)
-                Start-Sleep -Milliseconds 200
-                L "   stalled ($stallCount): sending shortcut fallback (Alt+N / Enter) to '$($targetWin.Title)'"
-                Shot "shortcut_fallback_$stallCount"
-                $wshell.SendKeys("%n")   # Alt+N (Next)
-                Start-Sleep -Milliseconds 600
-                $wshell.SendKeys("{ENTER}") # Enter (Default action)
-                Start-Sleep -Milliseconds 800
-                if ($stallCount -ge 8) {
-                  $wshell.SendKeys("%a") # Alt+A (I accept)
+            # Keyboard fallback after ~4 s without progress
+            if (-not $acted) {
+              $idle++
+              if ($idle -ge 4) {
+                $target = $wins[0]
+                [WinApi]::Foreground($target.Hwnd)
+                Start-Sleep -Milliseconds 300
+                L ("   idle fallback {0}: Alt+A / Alt+N / Enter on '{1}'" -f $idle, $target.Text)
+                Shot ('key_fallback_' + $idle)
+                $wshell.SendKeys('%a')
+                Start-Sleep -Milliseconds 400
+                $wshell.SendKeys('%n')
+                Start-Sleep -Milliseconds 400
+                $wshell.SendKeys('{ENTER}')
+                Start-Sleep 2
+                if ($idle -ge 12) {
+                  $wshell.SendKeys('%i')
                   Start-Sleep -Milliseconds 400
-                  $wshell.SendKeys("%i") # Alt+I (Install)
-                  $stallCount = 0
+                  $wshell.SendKeys('%f')
+                  $idle = 0
                 }
               }
             }
-
             Start-Sleep 1
           }
 
-          if ((Get-Date) -ge $deadline) { L "!! timeout: installation has not finished; inspect the last screenshots and logs" }
+          if ((Get-Date) -ge $deadline) { L '!! timeout: installation has not finished; inspect the last screenshots and logs' }
           Shot 'after_setup'
 
-          # ---- Automatic CRACK File Deployment ----
-          L "=== Deploying CRACK Files if present ==="
-          $crackDir = Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse -Directory -Filter "CRACK" -EA SilentlyContinue | Select-Object -First 1
-          if ($crackDir) {
-            L "Found CRACK directory: $($crackDir.FullName)"
-            $installedDirs = @(Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Recurse -Directory -EA SilentlyContinue |
-                               Where-Object { $_.FullName -match '(?i)scenarist' })
-            foreach ($idir in $installedDirs) {
-              L "Applying crack to directory: $($idir.FullName)"
-              Copy-Item -Path "$($crackDir.FullName)\*" -Destination $idir.FullName -Recurse -Force -EA SilentlyContinue
-            }
-          } else {
-            L "CRACK directory not found, skipping patch deployment"
-          }
-
-          # ---- Installation result and main program launch ----
           Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -EA SilentlyContinue |
             ? DisplayName | sort DisplayName | select DisplayName, DisplayVersion, InstallLocation | Format-Table -AutoSize | Out-String -Width 300 | Out-File "$env:OUT\logs\installed-programs.txt"
-          
           $cands = @(Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Recurse -Filter *.exe -EA SilentlyContinue |
                      ? { $_.FullName -match '(?i)scenarist' -and $_.Name -notmatch '(?i)unins|setup|crash|update|helper' })
           $cands | % { L "candidate main program: $($_.FullName)" }
@@ -446,13 +483,8 @@ jobs:
           if ($main) {
             L "launching main program: $($main.FullName)  version $($main.VersionInfo.FileVersion)"
             Start-Process $main.FullName -WorkingDirectory $main.DirectoryName
-            for ($i = 1; $i -le 40; $i++) {
-              Start-Sleep 3
-              Shot ("main_{0:D2}" -f $i)
-              if ($i % 10 -eq 0) { Get-Process | ? { $_.MainWindowTitle } | % { L "   window [$($_.ProcessName)] $($_.MainWindowTitle)" } }
-            }
-            foreach ($w in @($AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition))) {
-              try { if ($w.Current.Name -match '(?i)scenarist|licen|hasp|sentinel|error') { L "main program window '$($w.Current.Name)': $(($w.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | % { $_.Current.Name }) -join ' | ')" } } catch {} }
+            for ($i = 1; $i -le 40; $i++) { Start-Sleep 3; Shot ("main_{0:D2}" -f $i)
+              if ($i % 10 -eq 0) { Get-Process | ? { $_.MainWindowTitle } | % { L "   window [$($_.ProcessName)] $($_.MainWindowTitle)" } } }
           } else { L "Scenarist main program exe was not found; installation probably did not complete"; Shot 'no_main_exe' }
 
           New-Item "$shots\STOP" -ItemType File -Force | Out-Null
