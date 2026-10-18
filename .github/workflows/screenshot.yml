@@ -83,16 +83,16 @@ jobs:
         run: |
           $f = "$env:RUNNER_TEMP\pkg.bin"
           curl.exe -L --fail --retry 3 --retry-delay 5 -A "Mozilla/5.0" -o $f "$env:PKG_URL"
-          if ($LASTEXITCODE -ne 0) { throw "下载失败 (curl exit $LASTEXITCODE)，Filemail 链接可能已过期" }
+          if ($LASTEXITCODE -ne 0) { throw "1" }
           $fi = Get-Item $f
           $fs = [IO.File]::OpenRead($f); $hb = New-Object byte[] 8; [void]$fs.Read($hb,0,8); $fs.Close()
           Write-Host "size=$($fi.Length)  magic=$(($hb | % { $_.ToString('X2') }) -join ' ')"
-          if ($fi.Length -lt 1MB) { Get-Content $f -TotalCount 20; throw "文件太小，拿到的多半是 HTML 错误页，不是压缩包" }
+          if ($fi.Length -lt 1MB) { Get-Content $f -TotalCount 20; throw "2" }
           & "C:\Program Files\7-Zip\7z.exe" x $f "-o$env:RUNNER_TEMP\pkg" -y | Select-Object -Last 4
-          if ($LASTEXITCODE -ne 0) { throw "7-Zip 解压失败 (exit $LASTEXITCODE)" }
+          if ($LASTEXITCODE -ne 0) { throw "3" }
           Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse | % { "{0,12}  {1}" -f $_.Length, $_.FullName } | Tee-Object "$env:OUT\logs\package-tree.txt"
           $setup = Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse -Filter setup.exe | Select-Object -First 1
-          if (-not $setup) { throw "没有找到 setup.exe" }
+          if (-not $setup) { throw "4" }
           "SETUP_EXE=$($setup.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "PKG_DIR=$($setup.DirectoryName)"  | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "setup.exe => $($setup.FullName)"
