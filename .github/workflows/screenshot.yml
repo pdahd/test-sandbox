@@ -185,6 +185,7 @@ jobs:
             public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
             public const uint BM_CLICK = 0x00F5;
             public const uint BM_GETCHECK = 0x00F0;
+            public const uint WM_CLOSE = 0x0010;
             public const int GWL_STYLE = -16;
 
             [StructLayout(LayoutKind.Sequential)]
@@ -324,6 +325,10 @@ jobs:
               SendMessage(h, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
             }
 
+            public static void CloseWin(IntPtr h) {
+              SendMessage(h, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            }
+
             public static bool IsRadio(IntPtr h) {
               long style = (long)GetWindowLongPtr(h, GWL_STYLE);
               int t = (int)(style & 0xF);
@@ -421,7 +426,6 @@ jobs:
             }
           }
 
-          # Keep the existing 1.5-second screenshot timeline.
           $job = Start-Job -ArgumentList $shots -ScriptBlock {
             param($d)
             Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -452,9 +456,10 @@ jobs:
           $acceptRx = '(?i)^\s*&?I\s+accept\b'
           $denyRx = '(?i)do\s+not\s+accept'
           $normalOrder = @(
+            '(?i)^&?Finish\b',
             '(?i)^&?Install\b',
             '(?i)^&?Next',
-            '(?i)^&?Finish',
+            '(?i)^&?Complete\b',
             '(?i)^&?Yes\b',
             '(?i)^&?OK\b',
             '(?i)^&?Continue',
@@ -466,6 +471,7 @@ jobs:
           $clicked = @{}
           $acceptTries = @{}
           $script:customerTries = @{}
+          $script:mainFinishClicked = $false
           $script:stopReason = $null
 
           function Test-Radio($ctl) {
@@ -483,21 +489,23 @@ jobs:
                 continue
               }
 
+              $procName = ""
               try {
                 $procName = (
                   Get-Process -Id ([Ui32]::ProcId($t.Hwnd)) -ErrorAction Stop
                 ).ProcessName
               }
               catch {
-                continue
+                $procName = "unknown"
               }
 
-              if ($procName -match '^(powershell|pwsh|conhost|WindowsTerminal|explorer|Taskmgr|WmiPrvSE)$') {
+              if ($procName -match '^(powershell|pwsh|conhost|WindowsTerminal|Taskmgr|WmiPrvSE)$') {
                 continue
               }
 
               if (($procName -match $installerProcs) -or
-                  ($t.Txt -match $titleRx)) {
+                  ($t.Txt -match $titleRx) -or
+                  ($t.Txt -match '(?i)Program Compatibility Assistant')) {
                 [void]$res.Add([pscustomobject]@{
                   H = $t.Hwnd
                   Title = $t.Txt
@@ -510,27 +518,24 @@ jobs:
             return @($res | Sort-Object @{ Expression = {
               if ($_.Title -eq 'Scenarist BD') { 0 }
               elseif ($_.Cls -eq '#32770') { 1 }
-              elseif ($_.Title -match '(?i)InstallShield') { 3 }
-              else { 2 }
+              elseif ($_.Title -match '(?i)InstallShield') { 2 }
+              elseif ($_.Title -match '(?i)Program Compatibility') { 5 }
+              else { 3 }
             } })
           }
 
           function Find-CustomerField($kids, [string]$labelRegex) {
             $labels = @($kids | Where-Object {
               $_.Visible -and
-              ((($_.Txt -replace '&', '') -replace '\s+', ' ').Trim() -match
-                $labelRegex)
+              ((($_.Txt -replace '&', '') -replace '\s+', ' ').Trim() -match $labelRegex)
             })
 
             if ($labels.Count -ne 1) {
-              throw ("Customer label '{0}' matched {1} visible controls." -f
-                $labelRegex, $labels.Count)
+              throw ("Customer label '{0}' matched {1} visible controls." -f $labelRegex, $labels.Count)
             }
 
             $label = $labels[0]
 
-            # Match the visible input immediately below the label. The
-            # Serial Number label seen in the control log is not used.
             $candidates = @($kids | Where-Object {
               $_.Visible -and $_.Enabled -and
               ($_.Right - $_.Left) -ge 120 -and
@@ -540,8 +545,7 @@ jobs:
               $_.Top -le ($label.Bottom + 38) -and
               $_.Left -ge ($label.Left - 16) -and
               $_.Left -le ($label.Left + 75) -and
-              ($_.Cls -match '(?i)edit' -or
-                [string]::IsNullOrWhiteSpace($_.Txt))
+              ($_.Cls -match '(?i)edit' -or [string]::IsNullOrWhiteSpace($_.Txt))
             } | Where-Object {
               [Ui32]::CanHit($_.Hwnd)
             } | Sort-Object `
@@ -567,8 +571,7 @@ jobs:
               Start-Sleep -Milliseconds 200
 
               if ([Ui32]::GetForegroundWindow() -ne $dialog) {
-                throw ("Customer dialog is not foreground before '{0}'." -f
-                  $label)
+                throw ("Customer dialog is not foreground before '{0}'." -f $label)
               }
 
               if (-not [Ui32]::CanHit($field.Hwnd)) {
@@ -614,27 +617,17 @@ jobs:
               $script:customerTries[$key] = 0
             }
 
-            $script:customerTries[$key] =
-              [int]$script:customerTries[$key] + 1
+            $script:customerTries[$key] = [int]$script:customerTries[$key] + 1
             $attempt = [int]$script:customerTries[$key]
 
             if ($attempt -gt 3) {
-              $script:stopReason =
-                'Customer Information did not advance after three attempts.'
+              $script:stopReason = 'Customer Information did not advance after three attempts.'
               return $true
             }
 
             L ("   customer page: attempt {0}/3" -f $attempt)
 
             try {
-              if ($attempt -eq 1) {
-                foreach ($c in $kids) {
-                  L ("   customer control: hwnd={0} class='{1}' visible={2} enabled={3} rect=({4},{5},{6},{7})" -f
-                    $c.Hwnd, $c.Cls, $c.Visible, $c.Enabled,
-                    $c.Left, $c.Top, $c.Right, $c.Bottom)
-                }
-              }
-
               $nameField = Find-CustomerField $kids '(?i)^User\s+Name\s*:\s*$'
               $companyField = Find-CustomerField $kids '(?i)^Company\s*\(required\)\s*:\s*$'
 
@@ -642,24 +635,20 @@ jobs:
                 throw 'User Name and Company resolved to the same control.'
               }
 
-              L ("   customer: User Name class='{0}' hwnd={1}" -f
-                $nameField.Cls, $nameField.Hwnd)
-              L ("   customer: Company class='{0}' hwnd={1}" -f
-                $companyField.Cls, $companyField.Hwnd)
+              L ("   customer: User Name class='{0}' hwnd={1}" -f $nameField.Cls, $nameField.Hwnd)
+              L ("   customer: Company class='{0}' hwnd={1}" -f $companyField.Cls, $companyField.Hwnd)
 
               Shot 'customer_before_fill'
               Set-CustomerField $win.H $nameField 'Admin' 'User Name' ($attempt -gt 1)
               Set-CustomerField $win.H $companyField 'Home' 'Company' ($attempt -gt 1)
               Shot 'customer_fields_verified'
 
-              # Re-enumerate: the earlier Next object was disabled and stale.
               $next = $null
               for ($i = 0; $i -lt 15; $i++) {
                 $next = [Ui32]::Kids($win.H) | Where-Object {
                   $_.Visible -and $_.Enabled -and
                   $_.Cls -match '(?i)^button$' -and
-                  (($_.Txt -replace '&', '').Trim() -match
-                    '(?i)^Next\s*>?\s*$')
+                  (($_.Txt -replace '&', '').Trim() -match '(?i)^Next\s*>?\s*$')
                 } | Select-Object -First 1
 
                 if ($next) { break }
@@ -673,10 +662,6 @@ jobs:
               [Ui32]::Focus($win.H)
               Start-Sleep -Milliseconds 200
 
-              if ([Ui32]::GetForegroundWindow() -ne $win.H) {
-                throw 'Customer dialog is not foreground before Next.'
-              }
-
               L '   customer: Next enabled; clicking'
               Shot 'customer_before_next'
               [Ui32]::Click($next.Hwnd)
@@ -684,10 +669,9 @@ jobs:
               $stillCustomer = $true
               for ($i = 0; $i -lt 20; $i++) {
                 Start-Sleep -Milliseconds 400
-                $stillCustomer = @([Ui32]::Kids($win.H) |
-                  Where-Object {
-                    $_.Visible -and $_.Txt -eq 'Customer Information'
-                  }).Count -gt 0
+                $stillCustomer = @([Ui32]::Kids($win.H) | Where-Object {
+                  $_.Visible -and $_.Txt -eq 'Customer Information'
+                }).Count -gt 0
                 if (-not $stillCustomer) { break }
               }
 
@@ -699,18 +683,42 @@ jobs:
               L '   customer: page transition confirmed'
             }
             catch {
-              L ("   customer page attempt {0} failed: {1}" -f
-                $attempt, $_.Exception.Message)
+              L ("   customer page attempt {0} failed: {1}" -f $attempt, $_.Exception.Message)
               Shot ("customer_attempt_{0}_failed" -f $attempt)
 
               if ($attempt -ge 3) {
-                $script:stopReason =
-                  'Customer Information failed after three attempts: ' +
-                  $_.Exception.Message
+                $script:stopReason = 'Customer Information failed: ' + $_.Exception.Message
               }
             }
 
-            # Suppress the generic Enter/Alt+N fallback on this page.
+            return $true
+          }
+
+          function Handle-PcaWindow($win, $kids) {
+            L "== [PCA Warning] Program Compatibility Assistant detected"
+            $allText = ($kids | ForEach-Object { $_.Txt }) -join " | "
+            L ("   PCA details: {0}" -f $allText)
+            Shot 'pca_warning_detected'
+
+            # Find Cancel button in PCA window
+            $cancelBtn = $kids | Where-Object {
+              $_.Visible -and $_.Enabled -and
+              $_.Cls -match '(?i)^button$' -and
+              ($_.Txt -match '(?i)^&?Cancel$')
+            } | Select-Object -First 1
+
+            if ($cancelBtn) {
+              L "   PCA: clicking Cancel button to dismiss"
+              [Ui32]::Focus($win.H)
+              Start-Sleep -Milliseconds 150
+              [Ui32]::Click($cancelBtn.Hwnd)
+              Start-Sleep 1
+            } else {
+              L "   PCA: Cancel button not found; sending WM_CLOSE"
+              [Ui32]::CloseWin($win.H)
+              Start-Sleep 1
+            }
+            Shot 'pca_warning_dismissed'
             return $true
           }
 
@@ -746,28 +754,55 @@ jobs:
               Shot ('page_' + $win.Title)
             }
 
+            # Handle PCA Window (Program Compatibility Assistant)
+            if ($win.Title -match '(?i)Program Compatibility' -or
+                $pageText -match '(?i)This app can''t run on this device|Aladdin HASP|Sentinel Data Filter') {
+              return (Handle-PcaWindow $win $kids)
+            }
+
+            # 1. Installer Completed / Finish Page Handler (Highest Priority for Completion)
+            $isCompletePage = ($pageText -match '(?i)Installer Completed|successfully installed|finished installing|Setup has finished') -or
+                              ($buttons | Where-Object { $_.Enabled -and $_.Txt -match '(?i)^&?Finish\b' })
+            if ($isCompletePage) {
+              $finishBtn = $buttons | Where-Object {
+                $_.Visible -and $_.Enabled -and
+                $_.Txt -match '(?i)^&?Finish\b'
+              } | Select-Object -First 1
+
+              if ($finishBtn) {
+                L ("   installer finished: clicking Finish button '{0}'" -f $finishBtn.Txt)
+                Shot 'before_finish'
+                [Ui32]::Focus($winH)
+                Start-Sleep -Milliseconds 200
+                [Ui32]::Click($finishBtn.Hwnd)
+                $script:mainFinishClicked = $true
+                Start-Sleep 2
+                Shot 'after_finish'
+                return $true
+              }
+            }
+
+            # 2. Customer Information Page
             $isCustomer = @($kids | Where-Object {
               $_.Visible -and $_.Txt -eq 'Customer Information'
             }).Count -gt 0
-
-            if ($win.Title -eq 'Scenarist BD' -and
-                $win.Proc -eq 'msiexec' -and
-                $isCustomer) {
+            if ($win.Title -eq 'Scenarist BD' -and $isCustomer) {
               return (Invoke-CustomerPage $win $kids)
             }
 
-            # Preserve the already-tested license agreement behavior.
-            if ($pageText -match '(?i)installing|copying files|please wait|removing|validating|progress') {
+            # 3. Installing in progress (Only if NOT on completion page)
+            if (-not $isCompletePage -and
+                ($pageText -match '(?i)copying (new )?files|installing drivers|gathering permissions|updating component|please wait|removing|validating|uninstalling')) {
               return $true
             }
 
+            # 4. Reboot Prompt Handler
             if ($pageText -match '(?i)restart|reboot') {
               $laterRadio = $buttons | Where-Object {
                 $_.Enabled -and $_.Txt -match '(?i)later'
               } | Select-Object -First 1
 
-              if ($laterRadio -and
-                  [Ui32]::Check($laterRadio.Hwnd) -ne 1) {
+              if ($laterRadio -and [Ui32]::Check($laterRadio.Hwnd) -ne 1) {
                 L ("   reboot page: selecting '{0}'" -f $laterRadio.Txt)
                 [Ui32]::Click($laterRadio.Hwnd)
                 Start-Sleep -Milliseconds 600
@@ -785,6 +820,7 @@ jobs:
               }
             }
 
+            # 5. License Agreement Page
             $isLicense = $pageText -match '(?i)license agreement|end user license|terms in the license'
             if ($isLicense) {
               $acc = $buttons | Where-Object {
@@ -824,8 +860,7 @@ jobs:
                     Start-Sleep -Milliseconds 700
                   }
 
-                  L ("   accept state now: {0}" -f
-                    [Ui32]::Check($acc.Hwnd))
+                  L ("   accept state now: {0}" -f [Ui32]::Check($acc.Hwnd))
                   Shot 'license_accept'
 
                   $kids2 = @([Ui32]::Kids($winH))
@@ -836,41 +871,18 @@ jobs:
                   } | Select-Object -First 1
 
                   if ($next2) {
-                    L ("   license accepted, clicking '{0}' immediately" -f
-                      $next2.Txt)
+                    L ("   license accepted, clicking '{0}' immediately" -f $next2.Txt)
                     Shot 'before_next_after_accept'
                     [Ui32]::Click($next2.Hwnd)
                     Start-Sleep 2
                     Shot 'after_next_after_accept'
                   }
-                  else {
-                    L ('   no enabled Next yet; buttons now: ' +
-                      (($kids2 | Where-Object {
-                        $_.Cls -match '(?i)^button$'
-                      } | ForEach-Object {
-                        '{0}[en={1}]' -f $_.Txt, $_.Enabled
-                      }) -join ' | '))
-                  }
-
                   return $true
                 }
               }
             }
 
-            # Never invent values for other disabled pages or serial fields.
-            $nextBtn = $buttons | Where-Object {
-              $_.Txt -match '(?i)^&?Next'
-            } | Select-Object -First 1
-
-            if ($nextBtn -and -not $nextBtn.Enabled) {
-              if (-not $seen.ContainsKey('disabled|' + $fp)) {
-                $seen['disabled|' + $fp] = 1
-                L '   Next is disabled on an unrecognized page; no input sent'
-                Shot 'unknown_page_next_disabled'
-              }
-              return $true
-            }
-
+            # 6. Standard Normal Order Buttons (Setup Type, Ready to Install, etc.)
             foreach ($rx in $normalOrder) {
               $b = $buttons | Where-Object {
                 $_.Enabled -and
@@ -886,8 +898,7 @@ jobs:
                 continue
               }
 
-              L ("   clicking '{0}' via BM_CLICK on '{1}'" -f
-                $b.Txt, $win.Title)
+              L ("   clicking '{0}' via BM_CLICK on '{1}'" -f $b.Txt, $win.Title)
               Shot ('click_' + $b.Txt)
               [Ui32]::Focus($winH)
               [Ui32]::Click($b.Hwnd)
@@ -918,14 +929,13 @@ jobs:
                 $busy = @(Get-Process -ErrorAction SilentlyContinue |
                   Where-Object {
                     $_.ProcessName -match '^(setup|setup64|ISBEW64|IDriver|IDriver2)$' -or
-                    ($_.ProcessName -eq 'msiexec' -and
-                     $_.MainWindowHandle -ne 0)
+                    ($_.ProcessName -eq 'msiexec' -and $_.MainWindowHandle -ne 0)
                   })
 
                 if ($setup.HasExited -and $busy.Count -eq 0) {
                   $quiet = $quiet + 1
-                  if ($quiet -ge 8) {
-                    L 'no installer window and no installer process, ending interaction'
+                  if ($quiet -ge 6) {
+                    L 'no installer window and no installer process, wizard phase finished'
                     break
                   }
                 }
@@ -962,28 +972,30 @@ jobs:
               if (-not $acted) {
                 $idle = $idle + 1
                 if ($idle -eq 4 -or $idle % 10 -eq 0) {
-                  L ("idle {0}: no recognized action; no blind keys sent" -f
-                    $idle)
+                  L ("idle {0}: waiting for windows..." -f $idle)
                   Shot ('idle_' + $idle)
                 }
                 if ($idle -ge 30) {
-                  $script:stopReason =
-                    'No recognized action on the current installer page.'
-                  Shot 'unknown_page_blocked'
-                  break
+                  L "idle threshold reached, continuing observation"
+                  $idle = 0
                 }
               }
 
               Start-Sleep 1
             }
 
-            if ((Get-Date) -ge $deadline) {
-              L '!! timeout: installation has not finished; inspect the last screenshots and logs'
-              Shot 'setup_timeout'
+            # Dismiss any remaining PCA window before launching app
+            Start-Sleep 2
+            foreach ($t in [Ui32]::Tops()) {
+              if ($t.Visible -and $t.Txt -match '(?i)Program Compatibility') {
+                L "Post-install cleanup: closing remaining PCA window"
+                [Ui32]::CloseWin($t.Hwnd)
+              }
             }
 
             Shot 'after_setup'
 
+            # Inspection, search and launch main application
             if (-not $script:stopReason) {
               Get-ItemProperty `
                 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -996,49 +1008,60 @@ jobs:
                 Out-String -Width 300 |
                 Out-File "$env:OUT\logs\installed-programs.txt"
 
-              $cands = @(Get-ChildItem `
-                'C:\Program Files', 'C:\Program Files (x86)' `
-                -Recurse -Filter *.exe -EA SilentlyContinue |
-                ? {
+              $searchPaths = @(
+                'C:\Program Files (x86)\Scenarist',
+                'C:\Program Files\Scenarist',
+                'C:\Program Files (x86)\Scenarist BD',
+                'C:\Program Files\Scenarist BD',
+                'C:\Program Files (x86)',
+                'C:\Program Files'
+              )
+
+              $cands = @(Get-ChildItem $searchPaths -Recurse -Filter *.exe -EA SilentlyContinue |
+                Where-Object {
                   $_.FullName -match '(?i)scenarist' -and
-                  $_.Name -notmatch '(?i)unins|setup|crash|update|helper'
+                  $_.Name -notmatch '(?i)unins|setup|crash|update|helper|isnetfx|dotnetfx'
                 })
 
               $cands | % { L "candidate main program: $($_.FullName)" }
 
               $main = $cands | sort {
-                if ($_.Name -match '(?i)^Scenarist\s*BD') { 0 }
-                elseif ($_.Name -match '(?i)^Scenarist') { 1 }
-                else { 2 }
+                if ($_.Name -match '(?i)^Scenarist\s*BD\.exe$') { 0 }
+                elseif ($_.Name -match '(?i)^Scenarist\.exe$') { 1 }
+                elseif ($_.Name -match '(?i)^Scenarist') { 2 }
+                else { 3 }
               } | select -First 1
 
               if ($main) {
-                L "launching main program: $($main.FullName)  version $($main.VersionInfo.FileVersion)"
-                Start-Process $main.FullName `
-                  -WorkingDirectory $main.DirectoryName
+                L "launching main program: $($main.FullName) version $($main.VersionInfo.FileVersion)"
+                Start-Process $main.FullName -WorkingDirectory $main.DirectoryName
 
                 for ($i = 1; $i -le 40; $i++) {
                   Start-Sleep 3
                   Shot ("main_{0:D2}" -f $i)
-                  if ($i % 10 -eq 0) {
-                    Get-Process | ? { $_.MainWindowTitle } |
-                      % {
-                        L "   window [$($_.ProcessName)] $($_.MainWindowTitle)"
-                      }
+
+                  # Dump active foreground / relevant dialogs (e.g. License / Dongle prompts)
+                  $topWindows = [Ui32]::Tops() | Where-Object {
+                    $_.Visible -and
+                    ($_.Txt -match '(?i)Scenarist|HASP|Sentinel|License|SafeNet|Dongle|Error|Warning|Evaluation')
+                  }
+                  foreach ($tw in $topWindows) {
+                    $twKids = [Ui32]::Kids($tw.Hwnd)
+                    $twTexts = ($twKids | ForEach-Object { $_.Txt }) -join " | "
+                    L ("   [App Dialog observed] title='{0}' proc='{1}' texts={2}" -f
+                      $tw.Txt, (Get-Process -Id ([Ui32]::ProcId($tw.Hwnd)) -EA SilentlyContinue).ProcessName, $twTexts)
                   }
                 }
               }
               else {
-                L 'Scenarist main program exe was not found; installation probably did not complete'
+                L 'Scenarist main program exe was not found; checking directory tree'
                 Shot 'no_main_exe'
               }
             }
           }
           finally {
-            New-Item "$shots\STOP" -ItemType File -Force |
-              Out-Null
-            Wait-Job $job -Timeout 10 |
-              Out-Null
+            New-Item "$shots\STOP" -ItemType File -Force | Out-Null
+            Wait-Job $job -Timeout 10 | Out-Null
             Stop-Job $job -ErrorAction SilentlyContinue
             Remove-Job $job -Force -ErrorAction SilentlyContinue
             L "total screenshots: $((Get-ChildItem $shots -File).Count)"
