@@ -1,15 +1,27 @@
-name: Scenarist BD - install and screenshot
+name: Scenarist BD - install and capture
 
 on:
   workflow_dispatch:
     inputs:
       setup_timeout_min:
-        description: "Max minutes to auto-drive the setup wizard"
-        default: "35"
+        description: 'Installer timeout in minutes, from 1 to 40'
+        type: number
+        default: 35
+      accept_license:
+        description: 'I reviewed the agreements and authorize accepting installer terms'
+        type: boolean
+        default: false
+      expected_sha256:
+        description: 'Optional trusted SHA-256 of the downloaded archive'
+        type: string
+        required: false
+
+permissions: {}
 
 env:
   PKG_URL: "https://1008.filemail.com/api/file/get?filekey=qZ8PSCAMNDT_UbcUmAm998Sbdsf_rsbG0d_8ihincKT-36w0PEM-2ToKW8eACEmyrA"
   OUT: ${{ github.workspace }}\out
+  CAPTURE_MS: '1500'
 
 jobs:
   capture:
@@ -17,293 +29,677 @@ jobs:
     timeout-minutes: 110
     defaults:
       run:
-        shell: powershell   # Windows PowerShell 5.1 (UIAutomation is stable here)
+        shell: powershell
+    env:
+      SETUP_TIMEOUT_MIN: ${{ inputs.setup_timeout_min }}
+      ACCEPT_LICENSE: ${{ inputs.accept_license }}
+      EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
 
     steps:
-      # ------------------------------------------------------------------
-      - name: 1. Desktop check, minimize runner console, try higher resolution
+      - name: 01 Prepare desktop
+        timeout-minutes: 5
         run: |
-          New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\logs" | Out-Null
-          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-          Add-Type @"
-          using System; using System.Text; using System.Runtime.InteropServices;
-          public static class U32 {
-            public delegate bool EnumProc(IntPtr h, IntPtr l);
-            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
-            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
-            [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-            [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
-            public struct DEVMODE {
-              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName;
-              public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra; public int dmFields;
-              public int dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
-              public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
-              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName;
-              public short dmLogPixels; public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
-              public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight; }
-            [DllImport("user32.dll")] public static extern int EnumDisplaySettings(string n, int mode, ref DEVMODE dm);
-            [DllImport("user32.dll")] public static extern int ChangeDisplaySettings(ref DEVMODE dm, int flags);
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path "$env:OUT\shots", "$env:OUT\logs" | Out-Null
+          $minutes = 0
+          if (-not [int]::TryParse($env:SETUP_TIMEOUT_MIN, [ref]$minutes) -or $minutes -lt 1 -or $minutes -gt 40) {
+            throw 'setup_timeout_min must be an integer from 1 to 40.'
           }
-          "@
-          [void][U32]::SetProcessDPIAware()
-          $os = Get-CimInstance Win32_OperatingSystem
-          Write-Host "OS: $($os.Caption) | $($os.Version) | $($os.OSArchitecture)"
-          Write-Host "Session: $((Get-Process -Id $PID).SessionId)  UserInteractive: $([Environment]::UserInteractive)  Explorer: $([bool](Get-Process explorer -EA SilentlyContinue))"
+          if ($env:EXPECTED_SHA256 -and $env:EXPECTED_SHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+            throw 'expected_sha256 must be empty or exactly 64 hexadecimal characters.'
+          }
 
-          # Minimize the hosted-compute-agent console (NEVER close or kill it)
-          $cb = [U32+EnumProc]{ param($h, $l)
-            if ([U32]::IsWindowVisible($h)) {
-              $sb = New-Object System.Text.StringBuilder 1024
-              [void][U32]::GetWindowText($h, $sb, 1024); $t = $sb.ToString()
-              if ($t -and $t -match 'ProgramData\\GitHub|hosted-compute|Runner\.Listener') {
-                Write-Host "minimize: $t"; [void][U32]::ShowWindow($h, 6) } }
-            $true }
-          [void][U32]::EnumWindows($cb, [IntPtr]::Zero)
-          Get-Process ServerManager -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
-
-          # Try to raise resolution (Hyper-V virtual GPU may refuse; continue anyway)
-          $dm = New-Object U32+DEVMODE; $dm.dmSize = [Runtime.InteropServices.Marshal]::SizeOf($dm)
-          [void][U32]::EnumDisplaySettings($null, -1, [ref]$dm)
-          foreach ($res in @(@(1920,1080), @(1600,1200), @(1280,1024))) {
-            $dm.dmPelsWidth = $res[0]; $dm.dmPelsHeight = $res[1]; $dm.dmFields = 0x80000 -bor 0x100000
-            $rc = [U32]::ChangeDisplaySettings([ref]$dm, 0)
-            if ($rc -eq 0) { Write-Host "resolution -> $($res[0])x$($res[1])"; break } else { Write-Host "resolution $($res[0])x$($res[1]) rejected ($rc)" } }
-          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          Write-Host "Screen now: $($scr.Width)x$($scr.Height)"
-
-          # Baseline shot: if this fails there is no interactive desktop at all
-          $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
-          $g = [System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen(0,0,0,0,$b.Size)
-          $b.Save("$env:OUT\shots\K_000000_baseline_desktop.png"); $g.Dispose(); $b.Dispose()
-
-      # ------------------------------------------------------------------
-      - name: 2. Download and extract the package
-        run: |
-          $f = "$env:RUNNER_TEMP\pkg.bin"
-          curl.exe -L --fail --retry 3 --retry-delay 5 -A "Mozilla/5.0" -o $f "$env:PKG_URL"
-          if ($LASTEXITCODE -ne 0) { throw "download failed (curl exit $LASTEXITCODE); the Filemail link may have expired" }
-          $fi = Get-Item $f
-          $fs = [IO.File]::OpenRead($f); $hb = New-Object byte[] 8; [void]$fs.Read($hb,0,8); $fs.Close()
-          Write-Host "size=$($fi.Length)  magic=$(($hb | % { $_.ToString('X2') }) -join ' ')"
-          if ($fi.Length -lt 1MB) { Get-Content $f -TotalCount 20; throw "file too small: probably an HTML error page, not an archive" }
-          & "C:\Program Files\7-Zip\7z.exe" x $f "-o$env:RUNNER_TEMP\pkg" -y | Select-Object -Last 4
-          if ($LASTEXITCODE -ne 0) { throw "7-Zip extraction failed (exit $LASTEXITCODE)" }
-          Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse | % { "{0,12}  {1}" -f $_.Length, $_.FullName } | Tee-Object "$env:OUT\logs\package-tree.txt"
-          $setup = Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse -Filter setup.exe | Select-Object -First 1
-          if (-not $setup) { throw "setup.exe not found in archive" }
-          "SETUP_EXE=$($setup.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "PKG_DIR=$($setup.DirectoryName)"  | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "setup.exe => $($setup.FullName)"
-
-      # ------------------------------------------------------------------
-      - name: 3. Query system dependencies, install what is missing
-        timeout-minutes: 30
-        run: |
-          $log = "$env:OUT\logs\dependencies.txt"
-          function L($m){ $s = "[$(Get-Date -f HH:mm:ss)] $m"; Write-Host $s; Add-Content $log $s }
-          function Installed($rx){ Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -EA SilentlyContinue | ? { $_.DisplayName -match $rx } | % DisplayName }
-          function Run($exe,$a,$label){
-            if (-not $exe -or -not (Test-Path $exe)) { L "$label : installer missing, skip"; return }
-            try { $p = Start-Process -FilePath $exe -ArgumentList $a -Wait -PassThru; L "$label : exit $($p.ExitCode)  (0=ok 3010=reboot needed 1638/5100=already present or unsupported)" }
-            catch { L "$label : exception $($_.Exception.Message)" } }
-
-          L "=== Windows Installer service ==="
-          Start-Service msiserver -EA SilentlyContinue; L "msiserver: $((Get-Service msiserver).Status)"
-
-          L "=== .NET Framework 2.0 / 3.5 (NetFx3) ==="
-          $fx = Get-WindowsOptionalFeature -Online -FeatureName NetFx3
-          L "NetFx3 now: $($fx.State)"
-          if ($fx.State -ne 'Enabled') {
-            try { $r = Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -EA Stop; L "Enable-WindowsOptionalFeature done, RestartNeeded=$($r.RestartNeeded)" }
-            catch { L "Enable failed: $($_.Exception.Message), fallback to DISM"; dism.exe /Online /Enable-Feature /FeatureName:NetFx3 /All /NoRestart | Out-Null; L "dism exit $LASTEXITCODE" }
-            L "NetFx3 now: $((Get-WindowsOptionalFeature -Online -FeatureName NetFx3).State)" }
-          L ".NET 2.0 registry version: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v2.0.50727' -EA SilentlyContinue).Version)"
-          L ".NET 4.x Release: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -EA SilentlyContinue).Release)"
-          L "(dotnetfx20.exe / isnetfx.exe inside the package are NOT run separately: Server 2025 rejects standalone .NET 2.0 installers, and NetFx3 already contains the 2.0 runtime)"
-
-          L "=== Visual J# 2.0 Redistributable ==="
-          $vjHas = (Installed 'Visual J#') -or (Get-ChildItem "$env:windir\assembly" -Recurse -Filter vjslib.dll -EA SilentlyContinue)
-          if ($vjHas) { L "J# already present: $(Installed 'Visual J#')" }
-          else { $vj = Get-ChildItem "$env:PKG_DIR\ISSetupPrerequisites" -Recurse -Filter vjredist.exe | Select -First 1
-                 Run $vj.FullName '/q:a /c:"install.exe /q"' 'J# 2.0'
-                 L "J# after install: $(Installed 'Visual J#')" }
-
-          L "=== Java Runtime 1.5 (32-bit) ==="
-          $jreHas = (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment\1.5') -or (Installed 'J2SE Runtime Environment 5|Java\(TM\) 2 Runtime|Java 5')
-          if ($jreHas) { L "JRE 1.5 already present" }
-          else { $jre = Get-ChildItem "$env:PKG_DIR\ISSetupPrerequisites" -Recurse -Filter "jre-*.exe" | Select -First 1
-                 Run $jre.FullName '/s /v"/qn REBOOT=Suppress"' 'JRE 1.5.0_07'
-                 L "JRE registry: $(Test-Path 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment\1.5')" }
-
-          L "=== Visual C++ runtimes ==="
-          Installed 'Visual C\+\+' | sort -Unique | % { L "  already present: $_" }
-          foreach ($a in 'x86','x64') {
-            if (-not (Installed "Visual C\+\+ 2015-20\d\d.*$a")) {
-              $e = "$env:RUNNER_TEMP\vc_$a.exe"; curl.exe -sL -o $e "https://aka.ms/vs/17/release/vc_redist.$a.exe"
-              Run $e '/install /quiet /norestart' "VC++ 2015-2022 $a" } }
-
-          L "=== legacy DirectX 9 runtime (d3dx9) ==="
-          if (Test-Path "$env:windir\SysWOW64\d3dx9_43.dll") { L "d3dx9_43.dll already present" }
-          else { $dx = "$env:RUNNER_TEMP\dxwebsetup.exe"
-                 curl.exe -sL --fail -o $dx "https://download.microsoft.com/download/1/7/1/1718CCC4-6315-4D8E-9543-8E28A4E18C4C/dxwebsetup.exe"
-                 if ($LASTEXITCODE -eq 0) { Run $dx '/Q' 'DirectX End-User Runtime' } else { L "dxwebsetup download failed, skip" } }
-
-          L "=== Media Foundation (may be absent on Server) ==="
-          try { $mf = Get-WindowsFeature Server-Media-Foundation -EA Stop; L "Server-Media-Foundation: $($mf.InstallState)"
-                if ($mf.InstallState -ne 'Installed') { $r = Install-WindowsFeature Server-Media-Foundation -EA Stop; L "install result: Success=$($r.Success) Restart=$($r.RestartNeeded)" } }
-          catch { L "Media Foundation check failed: $($_.Exception.Message)" }
-          L "=== dependency step finished ==="
-
-      # ------------------------------------------------------------------
-      - name: 4. Run setup.exe, auto-drive wizard with screenshots, then launch main UI
-        timeout-minutes: 60
-        env:
-          SETUP_TIMEOUT_MIN: ${{ inputs.setup_timeout_min || '35' }}
-        run: |
+          # Keep every run block ASCII. The generated helper also has a UTF-8 BOM.
+          $library = @'
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing, UIAutomationClient, UIAutomationTypes
-          Add-Type @"
-          using System; using System.Runtime.InteropServices;
-          public static class Mx {
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public static class CaptureNative {
+            public delegate bool EnumProc(IntPtr h, IntPtr l);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc callback, IntPtr l);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder text, int size);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int command);
             [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
             [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+            [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
             [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-            [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e);
+            [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
+            [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+            [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+            public struct DEVMODE {
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName;
+              public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+              public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+              public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName;
+              public short dmLogPixels;
+              public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+              public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+            }
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern bool EnumDisplaySettings(string name, int mode, ref DEVMODE dm);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int ChangeDisplaySettings(ref DEVMODE dm, int flags);
           }
           "@
-          [void][Mx]::SetProcessDPIAware()
-          $shots = "$env:OUT\shots"; $log = "$env:OUT\logs\setup-ui.txt"
-          function L($m){ $s = "[$(Get-Date -f HH:mm:ss.fff)] $m"; Write-Host $s; Add-Content $log $s }
-          function Shot($tag){
-            try { $r = [System.Windows.Forms.SystemInformation]::VirtualScreen
-                  $b = New-Object System.Drawing.Bitmap $r.Width, $r.Height; $g = [System.Drawing.Graphics]::FromImage($b)
-                  $g.CopyFromScreen($r.Left, $r.Top, 0, 0, $b.Size)
-                  $t = ($tag -replace '[^\w\-]', '_'); if ($t.Length -gt 50) { $t = $t.Substring(0,50) }
-                  $b.Save("$shots\K_$(Get-Date -f HHmmss_fff)_$t.png", [System.Drawing.Imaging.ImageFormat]::Png)
-                  $g.Dispose(); $b.Dispose() }
-            catch { L "screenshot failed: $($_.Exception.Message)" } }
+          [void][CaptureNative]::SetProcessDPIAware()
 
-          # ---- background timeline capture: one full-screen shot every 1.5 s ----
-          $job = Start-Job -ArgumentList $shots -ScriptBlock {
-            param($d); Add-Type -AssemblyName System.Windows.Forms, System.Drawing; $i = 0
-            while (-not (Test-Path "$d\STOP")) {
-              try { $r = [System.Windows.Forms.SystemInformation]::VirtualScreen
-                    $b = New-Object System.Drawing.Bitmap $r.Width, $r.Height; $g = [System.Drawing.Graphics]::FromImage($b)
-                    $g.CopyFromScreen($r.Left, $r.Top, 0, 0, $b.Size)
-                    $b.Save(("$d\F_{0:D4}_{1}.jpg" -f (++$i), (Get-Date -f HHmmss)), [System.Drawing.Imaging.ImageFormat]::Jpeg)
-                    $g.Dispose(); $b.Dispose() } catch {}
-              Start-Sleep -Milliseconds 1500 } }
+          function Log([string]$Message) {
+            $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message
+            Write-Host $line
+            Add-Content -LiteralPath "$env:OUT\logs\driver.txt" -Value $line -Encoding UTF8
+          }
 
-          # ---- UI Automation helpers ----
-          $AE = [System.Windows.Automation.AutomationElement]; $TS = [System.Windows.Automation.TreeScope]; $CT = [System.Windows.Automation.ControlType]
-          function Kids($el, $type){ $c = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $type); @($el.FindAll($TS::Descendants, $c)) }
-          function Names($list){ (@($list) | % { $_.Current.Name }) -join ' | ' }
-          function Pick($el){   # select radio / check; only returns $true when state really changed
-            try { $sp = $el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($sp.Current.IsSelected) { return $false }; $sp.Select(); return $true } catch {}
-            try { $tp = $el.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); if ($tp.Current.ToggleState -eq 'On') { return $false }; $tp.Toggle(); return $true } catch {}
-            $false }
-          function Click($el, $hwnd){   # Invoke -> LegacyIAccessible -> real mouse click
-            try { $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke(); return 'invoke' } catch {}
-            try { $el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern).DoDefaultAction(); return 'legacy' } catch {}
-            try { $rc = $el.Current.BoundingRectangle; [void][Mx]::SetForegroundWindow($hwnd)
-                  [void][Mx]::SetCursorPos([int]($rc.X + $rc.Width/2), [int]($rc.Y + $rc.Height/2)); Start-Sleep -Milliseconds 150
-                  [Mx]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [Mx]::mouse_event(4,0,0,0,[UIntPtr]::Zero); return 'mouse' } catch { return 'FAILED' } }
+          function Minimize-RunnerConsole {
+            $callback = [CaptureNative+EnumProc]{ param($handle, $unused)
+              if ([CaptureNative]::IsWindowVisible($handle) -and -not [CaptureNative]::IsIconic($handle)) {
+                $text = New-Object System.Text.StringBuilder 1024
+                [void][CaptureNative]::GetWindowText($handle, $text, $text.Capacity)
+                if ($text.ToString() -match '(?i)ProgramData\\GitHub|hosted-compute-agent|Runner\.Listener') {
+                  [void][CaptureNative]::ShowWindow($handle, 6)
+                }
+              }
+              return $true
+            }
+            [void][CaptureNative]::EnumWindows($callback, [IntPtr]::Zero)
+            $console = [CaptureNative]::GetConsoleWindow()
+            if ($console -ne [IntPtr]::Zero) { [void][CaptureNative]::ShowWindow($console, 6) }
+          }
 
-          $procRx  = '^(setup|setup64|msiexec|ISBEW64|IDriver|IDriver2|_isdel|ikernel|jre\w*|vjredist|install|dotnetfx20|isnetfx|dxwebsetup|dxsetup|haspdinst|sentinel\w*|scenarist\w*)$'
-          $titleRx = '(?i)Scenarist|InstallShield|Java|J#|\.NET Framework|Sentinel|HASP|Setup|Install|Program Compatibility|Security Warning|Windows Installer|Visual C\+\+'
-          function SetupWindows(){
-            $out = @()
-            foreach ($w in @($AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition))) {
-              try { $p = Get-Process -Id $w.Current.ProcessId -EA SilentlyContinue; if (-not $p) { continue }
-                    if ($p.Id -eq $PID -or $p.ProcessName -match '^(powershell|pwsh|conhost|WindowsTerminal|explorer|Runner\.\w+)$') { continue }
-                    if ($p.ProcessName -match $procRx -or $w.Current.Name -match $titleRx) {
-                      $out += ,@{ El=$w; Proc=$p.ProcessName; Title=$w.Current.Name; H=[IntPtr]$w.Current.NativeWindowHandle } } } catch {} }
-            $out }
+          function Save-Shot([string]$Tag) {
+            Minimize-RunnerConsole
+            $bitmap = $null; $graphics = $null
+            try {
+              $rect = [System.Windows.Forms.SystemInformation]::VirtualScreen
+              $bitmap = New-Object System.Drawing.Bitmap $rect.Width, $rect.Height
+              $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+              $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
+              $safe = ($Tag -replace '[^A-Za-z0-9_-]', '_')
+              if ($safe.Length -gt 60) { $safe = $safe.Substring(0, 60) }
+              $stamp = [DateTime]::UtcNow.ToString('yyyyMMdd_HHmmss_fff')
+              $suffix = [Guid]::NewGuid().ToString('N').Substring(0, 6)
+              $bitmap.Save("$env:OUT\shots\K_${stamp}_${suffix}_${safe}.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            } finally {
+              if ($graphics) { $graphics.Dispose() }
+              if ($bitmap) { $bitmap.Dispose() }
+            }
+          }
 
-          $seen = @{}; $clicked = @{}; $warned = @{}
-          $acceptRx = '(?i)accept|agree'
-          $neverRx  = '(?i)cancel|back|exit|abort|restart now|reboot now|remove|repair|modify'
-          $normalOrder = @('(?i)^&?Install', '(?i)^&?Next', '(?i)^&?Finish', '(?i)^&?Yes', '(?i)^&?OK$', '(?i)^&?Continue', '(?i)^&?Run$', '(?i)installed correctly', '(?i)^&?Close$')
-          $rebootOrder = @('(?i)^&?No$', '(?i)^&?Finish', '(?i)^&?OK$', '(?i)^&?Close$')
+          function Start-Capture([string]$Phase) {
+            $stop = Join-Path $env:RUNNER_TEMP ('capture-' + [Guid]::NewGuid().ToString('N') + '.stop')
+            $job = Start-Job -ArgumentList $stop, $Phase, $env:OUT, ([int]$env:CAPTURE_MS) -ScriptBlock {
+              param($stopFile, $phaseName, $output, $delay)
+              Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+              Add-Type 'using System.Runtime.InteropServices; public static class FrameDpi { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }'
+              [void][FrameDpi]::SetProcessDPIAware()
+              $count = 0; $failures = 0
+              while (-not (Test-Path -LiteralPath $stopFile)) {
+                $bitmap = $null; $graphics = $null
+                try {
+                  $rect = [System.Windows.Forms.SystemInformation]::VirtualScreen
+                  $bitmap = New-Object System.Drawing.Bitmap $rect.Width, $rect.Height
+                  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                  $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
+                  $name = 'F_{0}_{1}_{2:D6}.jpg' -f [DateTime]::UtcNow.ToString('yyyyMMdd_HHmmss_fff'), $phaseName, (++$count)
+                  $bitmap.Save((Join-Path "$output\shots" $name), [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                  $failures = 0
+                } catch {
+                  Add-Content "$output\logs\capture-errors.txt" "$(Get-Date -Format o) $($_.Exception.Message)" -Encoding UTF8
+                  $failures++
+                  if ($failures -ge 3) { throw 'Three consecutive timeline capture failures.' }
+                } finally {
+                  if ($graphics) { $graphics.Dispose() }
+                  if ($bitmap) { $bitmap.Dispose() }
+                }
+                Start-Sleep -Milliseconds $delay
+              }
+            }
+            return [pscustomobject]@{ Job = $job; StopFile = $stop }
+          }
 
-          function Handle($w){
-            $el = $w.El; $h = $w.H
-            $texts = Names (Kids $el $CT::Text)
-            $buttons = @(Kids $el $CT::Button | ? { $_.Current.IsEnabled -and -not $_.Current.IsOffscreen })
-            $fp = "$h|$texts|$(Names $buttons)"
-            if (-not $seen.ContainsKey($fp)) { $seen[$fp] = 1
-              L "== window [$($w.Proc)] '$($w.Title)'"; L "   text: $texts"; L "   buttons: $(Names $buttons)"
-              Shot "page_$($w.Title)" }
-            $isReboot = $texts -match '(?i)restart|reboot'
-            # 1) license agreement
-            foreach ($r in @(Kids $el $CT::RadioButton) + @(Kids $el $CT::CheckBox)) {
-              if ($r.Current.IsEnabled -and $r.Current.Name -match $acceptRx) { if (Pick $r) { L "   selected: $($r.Current.Name)"; Start-Sleep -Milliseconds 800; return $true } } }
-            # 2) reboot prompt -> choose later
-            if ($isReboot) { foreach ($r in @(Kids $el $CT::RadioButton)) {
-              if ($r.Current.Name -match '(?i)later|^No') { if (Pick $r) { L "   selected (no reboot): $($r.Current.Name)"; Start-Sleep -Milliseconds 800; return $true } } } }
-            # 3) Next disabled and an empty input box -> fill placeholder (Customer Information page)
-            $nextAll = @(Kids $el $CT::Button | ? { $_.Current.Name -match '(?i)^&?Next' })
-            if ($nextAll.Count -gt 0 -and -not ($nextAll | ? { $_.Current.IsEnabled })) {
-              foreach ($e in @(Kids $el $CT::Edit)) { try { $vp = $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-                if (-not $vp.Current.IsReadOnly -and [string]::IsNullOrWhiteSpace($vp.Current.Value)) { $vp.SetValue('GitHubActions'); L "   filled input '$($e.Current.Name)'"; Start-Sleep -Milliseconds 500; return $true } } catch {} }
-              if (-not $warned[$fp]) { $warned[$fp] = 1; L "   !! Next is disabled and there is no fillable input (maybe a serial is required); waiting..." } }
-            # 4) click by priority
-            $order = if ($isReboot) { $rebootOrder } else { $normalOrder }
-            foreach ($rx in $order) {
-              $b = $buttons | ? { $_.Current.Name -match $rx -and $_.Current.Name -notmatch $neverRx } | select -First 1
-              if (-not $b) { continue }
-              $ck = "$fp|$($b.Current.Name)"
-              if ($clicked.ContainsKey($ck) -and ((Get-Date) - $clicked[$ck]).TotalSeconds -lt 10) { return $false }
-              [void][Mx]::SetForegroundWindow($h); Start-Sleep -Milliseconds 300
-              Shot "click_$($b.Current.Name)"
-              $how = Click $b $h; $clicked[$ck] = Get-Date
-              L "   clicked [$($b.Current.Name)] via $how @ '$($w.Title)'"
-              Start-Sleep 2; return $true }
-            $false }
+          function Stop-Capture($Recorder) {
+            if (-not $Recorder) { return }
+            New-Item -ItemType File -Path $Recorder.StopFile -Force | Out-Null
+            Wait-Job -Job $Recorder.Job -Timeout 8 | Out-Null
+            if ($Recorder.Job.State -eq 'Running') { Stop-Job -Job $Recorder.Job }
+            if ($Recorder.Job.State -eq 'Failed') { Log 'WARNING: the timeline recorder failed; inspect capture-errors.txt.' }
+            Receive-Job -Job $Recorder.Job -ErrorAction Continue | Out-Null
+            Remove-Job -Job $Recorder.Job -Force
+            Remove-Item -LiteralPath $Recorder.StopFile -Force -ErrorAction SilentlyContinue
+          }
 
-          # ---- main flow ----
-          Shot 'desktop_before_setup'
-          $setup = Start-Process -FilePath $env:SETUP_EXE -WorkingDirectory $env:PKG_DIR -PassThru
-          L "setup.exe started pid=$($setup.Id)  timeout=$env:SETUP_TIMEOUT_MIN min"
-          $deadline = (Get-Date).AddMinutes([int]$env:SETUP_TIMEOUT_MIN); $quiet = 0
-          while ((Get-Date) -lt $deadline) {
-            $wins = @(SetupWindows)
-            if ($wins.Count -eq 0) {
-              $busy = @(Get-Process -EA SilentlyContinue | ? { $_.ProcessName -match '^(setup|ISBEW64|IDriver|IDriver2)$' -or ($_.ProcessName -eq 'msiexec' -and $_.MainWindowHandle -ne 0) })
-              if ($setup.HasExited -and $busy.Count -eq 0) { if ((++$quiet) -ge 8) { L "setup process exited and no related window remains; ending interaction"; break } }
-            } else { $quiet = 0 }
-            $acted = $false
-            foreach ($w in $wins) { try { if (Handle $w) { $acted = $true; break } } catch { L "window handling exception: $($_.Exception.Message)" } }
-            if (-not $acted) { Start-Sleep 1 } }
-          if ((Get-Date) -ge $deadline) { L "!! timeout: setup still not finished, inspect the last screenshots and the log" }
-          Shot 'after_setup'
+          function Get-InstalledApps {
+            Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName } |
+              Select-Object DisplayName, DisplayVersion, InstallLocation, PSPath
+          }
 
-          # ---- install result & launch main program ----
-          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -EA SilentlyContinue |
-            ? DisplayName | sort DisplayName | select DisplayName, DisplayVersion, InstallLocation | Format-Table -AutoSize | Out-String -Width 300 | Out-File "$env:OUT\logs\installed-programs.txt"
-          $cands = @(Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Recurse -Filter *.exe -EA SilentlyContinue |
-                     ? { $_.FullName -match '(?i)scenarist' -and $_.Name -notmatch '(?i)unins|setup|crash|update|helper' })
-          $cands | % { L "candidate main exe: $($_.FullName)" }
-          $main = $cands | sort { if ($_.Name -match '(?i)^Scenarist\s*BD') {0} elseif ($_.Name -match '(?i)^Scenarist') {1} else {2} } | select -First 1
-          if ($main) {
-            L "launching main program: $($main.FullName)  version $($main.VersionInfo.FileVersion)"
-            Start-Process $main.FullName -WorkingDirectory $main.DirectoryName
-            for ($i = 1; $i -le 40; $i++) { Start-Sleep 3; Shot ("main_{0:D2}" -f $i)
-              if ($i % 10 -eq 0) { Get-Process | ? { $_.MainWindowTitle } | % { L "   window [$($_.ProcessName)] $($_.MainWindowTitle)" } } }
-            foreach ($w in @($AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition))) {
-              try { if ($w.Current.Name -match '(?i)scenarist|licen|hasp|sentinel|error') { L "main-program window '$($w.Current.Name)': $(Names (Kids $w $CT::Text))" } } catch {} }
-          } else { L "Scenarist main exe not found; installation probably did not complete"; Shot 'no_main_exe' }
+          function Test-VisualJ {
+            $registration = @(
+              Get-InstalledApps | Where-Object {
+                $_.DisplayName -match 'Visual J#' -and $_.DisplayVersion -match '^2\.'
+              }
+            )
+            $roots = @(
+              "$env:windir\Microsoft.NET\Framework\v2.0.50727",
+              "$env:windir\assembly\GAC\vjslib",
+              "$env:windir\assembly\GAC_32\vjslib",
+              "$env:windir\assembly\GAC_MSIL\vjslib"
+            )
+            $assemblies = @(Get-ChildItem -Path $roots -Filter vjslib.dll -Recurse -File -ErrorAction SilentlyContinue)
+            foreach ($file in $assemblies) {
+              try {
+                $version = [Reflection.AssemblyName]::GetAssemblyName($file.FullName).Version
+                if ($registration.Count -gt 0 -and $version.Major -eq 2) { return $true }
+              } catch { Log "Unable to inspect J# assembly: $($file.FullName)" }
+            }
+            return $false
+          }
 
-          New-Item "$shots\STOP" -ItemType File -Force | Out-Null
-          Wait-Job $job -Timeout 10 | Out-Null; Remove-Job $job -Force -EA SilentlyContinue; Remove-Item "$shots\STOP" -EA SilentlyContinue
-          L "total screenshots: $((Get-ChildItem $shots -File).Count)"
+          function Get-Java15 {
+            $base = $null; $key = $null; $stream = $null; $reader = $null; $process = $null
+            try {
+              $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry32)
+              $key = $base.OpenSubKey('SOFTWARE\JavaSoft\Java Runtime Environment\1.5.0_07')
+              if (-not $key) { return $null }
+              $home = [string]$key.GetValue('JavaHome')
+              if (-not $home) { return $null }
+              $java = Join-Path $home 'bin\java.exe'
+              if (-not (Test-Path -LiteralPath $java)) { return $null }
+              $stream = [IO.File]::OpenRead($java)
+              $reader = New-Object IO.BinaryReader $stream
+              $stream.Position = 0x3c
+              $peOffset = $reader.ReadInt32()
+              $stream.Position = $peOffset
+              if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x14c) { return $null }
+              $start = New-Object Diagnostics.ProcessStartInfo
+              $start.FileName = $java; $start.Arguments = '-version'
+              $start.UseShellExecute = $false; $start.CreateNoWindow = $true
+              $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+              $process = [Diagnostics.Process]::Start($start)
+              if (-not $process.WaitForExit(15000)) { $process.Kill(); return $null }
+              $version = $process.StandardError.ReadToEnd() + $process.StandardOutput.ReadToEnd()
+              if ($process.ExitCode -eq 0 -and $version -match 'version "1\.5\.0_07"') { return $java }
+              return $null
+            } catch { Log "Java probe failed: $($_.Exception.Message)"; return $null }
+            finally {
+              if ($process) { $process.Dispose() }
+              if ($reader) { $reader.Dispose() } elseif ($stream) { $stream.Dispose() }
+              if ($key) { $key.Dispose() }
+              if ($base) { $base.Dispose() }
+            }
+          }
 
-      # ------------------------------------------------------------------
-      - name: 5. Upload screenshots and logs (always run)
+          function Get-DependencyState {
+            return [pscustomobject]@{
+              NetFx3 = [string](Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction Stop).State
+              VisualJ2Evidence = [bool](Test-VisualJ)
+              Java15x86 = [string](Get-Java15)
+            }
+          }
+
+          function Assert-Dependencies {
+            $state = Get-DependencyState
+            $state | ConvertTo-Json | Set-Content "$env:OUT\logs\dependencies-final.json" -Encoding UTF8
+            if ($state.NetFx3 -ne 'Enabled' -or -not $state.VisualJ2Evidence -or -not $state.Java15x86) {
+              throw 'Known prerequisites are not verified. See dependencies-final.json. Setup will not be launched.'
+            }
+            Log 'Known prerequisite checks passed. This is not proof of all undocumented requirements.'
+          }
+
+          function Invoke-Package([string]$File, [string]$Arguments, [string]$Label) {
+            if (-not $File -or -not (Test-Path -LiteralPath $File)) { throw "$Label installer is missing." }
+            if ($env:ACCEPT_LICENSE -ne 'true') { throw "Review the agreements and set accept_license to install $Label." }
+            Log "Starting prerequisite: $Label"
+            Save-Shot ("before_" + $Label)
+            $process = Start-Process -FilePath $File -ArgumentList $Arguments -WorkingDirectory (Split-Path $File) -PassThru
+            try {
+              if (-not $process.WaitForExit(480000)) { throw "$Label exceeded 8 minutes. See the screenshot timeline." }
+              $process.Refresh()
+              $code = $process.ExitCode
+              Log "$Label exit code: $code"
+              Save-Shot ("after_" + $Label)
+              if ($code -eq 3010 -or $code -eq 1641) { throw "$Label requires or initiated a reboot. This job cannot resume a rebooted hosted runner." }
+              if ($code -ne 0) { throw "$Label failed with exit code $code. Nonzero is not treated as success." }
+            } finally { $process.Dispose() }
+          }
+          '@
+          if ($library -match '[^\x00-\x7F]') { throw 'The helper contains non-ASCII source text.' }
+          $helper = Join-Path $env:RUNNER_TEMP 'capture-lib.ps1'
+          [IO.File]::WriteAllText($helper, $library, (New-Object Text.UTF8Encoding $true))
+          $tokens = $null; $errors = $null
+          [void][Management.Automation.Language.Parser]::ParseFile($helper, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { throw ($errors | Out-String) }
+          . $helper
+
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, OSArchitecture, Version |
+            Format-List | Out-File "$env:OUT\logs\system.txt" -Encoding UTF8
+          $session = (Get-Process -Id $PID).SessionId
+          Log "Session=$session; UserInteractive=$([Environment]::UserInteractive)"
+          if ($session -eq 0 -or -not [Environment]::UserInteractive) { throw 'No usable interactive desktop was detected.' }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = New-Object Security.Principal.WindowsPrincipal $identity
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'The workflow requires an elevated runner process for Windows feature installation.'
+          }
+          Minimize-RunnerConsole
+          $mode = New-Object CaptureNative+DEVMODE
+          $mode.dmSize = [Runtime.InteropServices.Marshal]::SizeOf($mode)
+          if ([CaptureNative]::EnumDisplaySettings($null, -1, [ref]$mode)) {
+            foreach ($size in @(@(1920,1080), @(1600,1200), @(1280,1024))) {
+              $mode.dmPelsWidth = $size[0]; $mode.dmPelsHeight = $size[1]
+              $mode.dmFields = 0x80000 -bor 0x100000
+              $result = [CaptureNative]::ChangeDisplaySettings([ref]$mode, 0)
+              Log "Requested display $($size[0])x$($size[1]); result=$result"
+              if ($result -eq 0) { break }
+            }
+          }
+          Start-Sleep -Seconds 2
+          Save-Shot 'baseline_desktop'
+          Log 'Baseline saved. A screenshot file alone does not prove the desktop is unlocked or non-black.'
+
+      - name: 02 Download and extract
+        timeout-minutes: 14
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . "$env:RUNNER_TEMP\capture-lib.ps1"
+          $archive = Join-Path $env:RUNNER_TEMP 'scenarist-package.bin'
+          $package = Join-Path $env:RUNNER_TEMP 'scenarist-package'
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path -LiteralPath $sevenZip)) { throw '7-Zip was not found on this runner.' }
+
+          curl.exe --location --fail --silent --show-error --stderr "$env:OUT\logs\curl-error.txt" --retry 3 --retry-delay 5 --retry-max-time 90 --connect-timeout 30 --max-time 600 --output $archive "$env:PKG_URL"
+          $curlExit = $LASTEXITCODE
+          if ($curlExit -ne 0) {
+            Log "curl exited with code $curlExit. See curl-error.txt."
+            throw "Download failed (curl exit $curlExit). Check the HTTP response, URL and network."
+          }
+
+          $file = Get-Item -LiteralPath $archive
+          if ($file.Length -eq 0) { throw 'The downloaded file is empty.' }
+          $stream = [IO.File]::OpenRead($archive)
+          try {
+            $header = New-Object byte[] 16
+            $length = $stream.Read($header, 0, $header.Length)
+            $magic = (($header[0..($length - 1)] | ForEach-Object { $_.ToString('X2') }) -join ' ')
+          } finally { $stream.Dispose() }
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          "Bytes=$($file.Length)`r`nMagic=$magic`r`nSHA256=$hash" |
+            Set-Content "$env:OUT\logs\download.txt" -Encoding UTF8
+          Log "Download complete: $($file.Length) bytes; SHA256=$hash"
+          if ($env:EXPECTED_SHA256 -and $hash -ne $env:EXPECTED_SHA256) { throw 'Archive SHA-256 does not match the trusted expected value.' }
+
+          # 7-Zip detects ZIP, RAR and 7z from the content, not the .bin suffix.
+          $test = Start-Process -FilePath $sevenZip -ArgumentList ('t -y "{0}"' -f $archive) -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:OUT\logs\archive-test.txt" -RedirectStandardError "$env:OUT\logs\archive-test-error.txt"
+          $testCode = $test.ExitCode; $test.Dispose()
+          Get-Content "$env:OUT\logs\archive-test.txt" -Tail 15
+          if ($testCode -ne 0) { throw "Archive test failed (7-Zip exit $testCode). Inspect archive-test logs." }
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          $extract = Start-Process -FilePath $sevenZip -ArgumentList ('x -y "{0}" -o"{1}"' -f $archive, $package) -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:OUT\logs\archive-extract.txt" -RedirectStandardError "$env:OUT\logs\archive-extract-error.txt"
+          $extractCode = $extract.ExitCode; $extract.Dispose()
+          if ($extractCode -ne 0) { throw "Extraction failed (7-Zip exit $extractCode)." }
+
+          Get-ChildItem -LiteralPath $package -Recurse -File | ForEach-Object {
+            '{0,12}  {1}' -f $_.Length, $_.FullName
+          } | Set-Content "$env:OUT\logs\package-tree.txt" -Encoding UTF8
+          $setups = @(Get-ChildItem -LiteralPath $package -Filter setup.exe -File -Recurse |
+            Where-Object { $_.FullName -notmatch '\\ISSetupPrerequisites\\' })
+          if ($setups.Count -ne 1) { throw "Expected exactly one main setup.exe; found $($setups.Count). Inspect package-tree.txt." }
+          $setup = $setups[0]
+          Get-ChildItem -LiteralPath $setup.DirectoryName -Filter *.exe -Recurse -File | ForEach-Object {
+            $signature = Get-AuthenticodeSignature -LiteralPath $_.FullName
+            [pscustomobject]@{ File = $_.FullName; Status = [string]$signature.Status; Signer = $signature.SignerCertificate.Subject }
+          } | ConvertTo-Json -Depth 3 | Set-Content "$env:OUT\logs\signatures.json" -Encoding UTF8
+          $utf8 = New-Object Text.UTF8Encoding $false
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "SETUP_EXE=$($setup.FullName)`nPKG_DIR=$($setup.DirectoryName)`n", $utf8)
+          Log "Main installer: $($setup.FullName)"
+          $global:LASTEXITCODE = 0
+
+      - name: 03 Query and verify dependencies
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . "$env:RUNNER_TEMP\capture-lib.ps1"
+          $recorder = Start-Capture 'dependencies'
+          try {
+            Save-Shot 'dependencies_before'
+            Get-InstalledApps | Sort-Object DisplayName | ConvertTo-Json -Depth 3 |
+              Set-Content "$env:OUT\logs\installed-before.json" -Encoding UTF8
+            $state = Get-DependencyState
+            $state | ConvertTo-Json | Set-Content "$env:OUT\logs\dependencies-before.json" -Encoding UTF8
+            Log ("Before installation: " + ($state | ConvertTo-Json -Compress))
+            Get-Service msiserver | Format-List Name, Status |
+              Out-File "$env:OUT\logs\windows-installer-service.txt" -Encoding UTF8
+
+            if ($state.NetFx3 -ne 'Enabled') {
+              Log 'Enabling NetFx3, which includes .NET Framework 2.0 and 3.0.'
+              $result = Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -ErrorAction Stop
+              Log "NetFx3 RestartNeeded=$($result.RestartNeeded)"
+              if ($result.RestartNeeded) { throw 'NetFx3 needs a reboot. Stop rather than pretending the runtime is ready.' }
+            }
+            if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3).State -ne 'Enabled') {
+              throw 'NetFx3 was not enabled. A matching Windows component source may be required.'
+            }
+
+            if (-not (Test-VisualJ)) {
+              $vj = @(Get-ChildItem -LiteralPath $env:PKG_DIR -Recurse -File -Filter vjredist.exe)
+              if ($vj.Count -ne 1) { throw 'Expected one bundled vjredist.exe.' }
+              Invoke-Package $vj[0].FullName '/q:a /c:"install.exe /q"' 'Visual_JSharp_2'
+              Start-Sleep -Seconds 5
+              if (-not (Test-VisualJ)) { throw 'Visual J# registration and vjslib.dll version 2 were not verified after installation.' }
+            }
+
+            if (-not (Get-Java15)) {
+              $java = @(Get-ChildItem -LiteralPath $env:PKG_DIR -Recurse -File -Filter jre-1_5_0_07-windows-i586-p.exe)
+              if ($java.Count -ne 1) { throw 'Expected one bundled JRE 1.5.0_07 x86 installer.' }
+              Invoke-Package $java[0].FullName '/s /v"/qn REBOOT=ReallySuppress"' 'Java_1_5_0_07_x86'
+              Start-Sleep -Seconds 5
+              if (-not (Get-Java15)) { throw 'Java 1.5.0_07 x86 failed its registry, PE architecture or java -version check.' }
+            }
+
+            # Inventory additional components; do not invent requirements from a directory tree.
+            Get-InstalledApps | Where-Object { $_.DisplayName -match 'Visual C\+\+|Sentinel|HASP' } |
+              ConvertTo-Json -Depth 3 | Set-Content "$env:OUT\logs\additional-runtimes.json" -Encoding UTF8
+            "D3DX9_43_x86=$(Test-Path "$env:windir\SysWOW64\d3dx9_43.dll")" |
+              Set-Content "$env:OUT\logs\additional-components.txt" -Encoding UTF8
+            try {
+              Get-WindowsFeature Server-Media-Foundation -ErrorAction Stop | Format-List Name, InstallState |
+                Out-File "$env:OUT\logs\additional-components.txt" -Append -Encoding UTF8
+            } catch { Log "Media Foundation inventory unavailable: $($_.Exception.Message)" }
+            Assert-Dependencies
+            Save-Shot 'dependencies_verified'
+          } catch {
+            Log "Dependency stage stopped: $($_.Exception.Message)"
+            try { Save-Shot 'dependency_failure' } catch { Log 'Failure screenshot could not be captured.' }
+            throw
+          } finally {
+            Stop-Capture $recorder
+            Copy-Item "$env:windir\Logs\DISM\dism.log" "$env:OUT\logs\dism.log" -ErrorAction SilentlyContinue
+          }
+
+      - name: 04 Install and capture
+        timeout-minutes: 45
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . "$env:RUNNER_TEMP\capture-lib.ps1"
+          Assert-Dependencies
+          $AE = [System.Windows.Automation.AutomationElement]
+          $TS = [System.Windows.Automation.TreeScope]
+          $CT = [System.Windows.Automation.ControlType]
+          $session = (Get-Process -Id $PID).SessionId
+          $started = Get-Date
+          $script:family = @{}
+          $script:seen = @{}
+          $script:clicked = @{}
+          $script:lastChange = Get-Date
+
+          function Controls($Element, $Type) {
+            $condition = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $Type)
+            foreach ($child in $Element.FindAll($TS::Descendants, $condition)) { $child }
+          }
+          function Names($Elements) {
+            return (@($Elements | ForEach-Object { $_.Current.Name }) -join ' | ')
+          }
+          function Clean-Name([string]$Name) {
+            return (($Name -replace '&', '' -replace '[<>]', '').Trim())
+          }
+          function Register-Family {
+            $processes = @(Get-CimInstance Win32_Process)
+            $current = @{}
+            foreach ($process in $processes) { $current[[int]$process.ProcessId] = $process }
+            for ($pass = 0; $pass -lt 5; $pass++) {
+              foreach ($process in $processes) {
+                $parentId = [int]$process.ParentProcessId
+                if (-not $process.CreationDate -or -not $script:family.ContainsKey($parentId)) { continue }
+                $created = $process.CreationDate.ToUniversalTime()
+                $parentStart = $script:family[$parentId]
+                if ($current.ContainsKey($parentId)) {
+                  $liveStart = $current[$parentId].CreationDate.ToUniversalTime()
+                  if ([Math]::Abs(($liveStart - $parentStart).TotalSeconds) -gt 1) { continue }
+                }
+                if ($created -ge $parentStart -and $created -ge $started.ToUniversalTime().AddSeconds(-2)) {
+                  $script:family[[int]$process.ProcessId] = $created
+                }
+              }
+            }
+          }
+          function Installer-Windows {
+            Register-Family
+            $trusted = '^(setup|setup64|msiexec|ISBEW64|IDriver|IDriver2|ikernel|jre.*|vjredist|install|haspdinst)$'
+            foreach ($window in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+              try {
+                if ($window.Current.IsOffscreen -or -not $window.Current.IsEnabled) { continue }
+                $process = Get-Process -Id $window.Current.ProcessId -ErrorAction Stop
+                if ($process.SessionId -ne $session -or $process.StartTime -lt $started.AddSeconds(-2)) { continue }
+                if ($process.ProcessName -match '^(powershell|pwsh|conhost|WindowsTerminal|explorer|Runner\..*|Scenarist.*)$') { continue }
+                $familyMember = $script:family.ContainsKey($process.Id) -and [Math]::Abs(($process.StartTime.ToUniversalTime() - $script:family[$process.Id]).TotalSeconds) -lt 1
+                $recognized = $process.ProcessName -match $trusted -and $window.Current.Name -match '(?i)Scenarist|InstallShield|Java|J#|Windows Installer|Sentinel'
+                if ($familyMember -or $recognized) {
+                  [pscustomobject]@{ Element = $window; Handle = [IntPtr]$window.Current.NativeWindowHandle; Title = $window.Current.Name; Process = $process.ProcessName }
+                }
+              } catch { continue }
+            }
+          }
+          function Select-Choice($Element) {
+            $pattern = $null
+            if ($Element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) {
+              if ($pattern.Current.IsSelected) { return $false }
+              $pattern.Select()
+              if (-not $pattern.Current.IsSelected) { throw 'The radio-button selection could not be confirmed.' }
+              return $true
+            }
+            if ($Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
+              if ($pattern.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On) { return $false }
+              $pattern.Toggle()
+              if ($pattern.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::On) { throw 'The checkbox selection could not be confirmed.' }
+              return $true
+            }
+            throw 'The selection control exposes no supported safe selection pattern.'
+          }
+          function Invoke-Control($Button, [IntPtr]$Handle) {
+            $pattern = $null
+            if ($Button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+              $pattern.Invoke(); return 'UIA Invoke'
+            }
+            [void][CaptureNative]::SetForegroundWindow($Handle)
+            Start-Sleep -Milliseconds 250
+            if ([CaptureNative]::GetForegroundWindow() -ne $Handle) { throw 'Mouse fallback refused: the target did not become foreground.' }
+            $rect = $Button.Current.BoundingRectangle
+            if ($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0) { throw 'Mouse fallback refused: invalid button rectangle.' }
+            $x = [int]($rect.X + $rect.Width / 2); $y = [int]($rect.Y + $rect.Height / 2)
+            if (-not [System.Windows.Forms.SystemInformation]::VirtualScreen.Contains($x, $y)) { throw 'Mouse fallback refused: button is outside the virtual screen.' }
+            [void][CaptureNative]::SetCursorPos($x, $y)
+            [CaptureNative]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+            [CaptureNative]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+            return 'foreground mouse'
+          }
+          function Handle-Window($Window) {
+            $element = $Window.Element
+            $text = Names (Controls $element $CT::Text)
+            $buttons = @(Controls $element $CT::Button | Where-Object { $_.Current.IsEnabled -and -not $_.Current.IsOffscreen })
+            $choices = @(@(Controls $element $CT::RadioButton) + @(Controls $element $CT::CheckBox) | Where-Object { $_.Current.IsEnabled -and -not $_.Current.IsOffscreen })
+            $allText = $Window.Title + ' | ' + $text + ' | ' + (Names $choices) + ' | ' + (Names $buttons)
+            $fingerprint = "$($Window.Handle)|$allText"
+            if (-not $script:seen.ContainsKey($fingerprint)) {
+              $script:seen[$fingerprint] = $true; $script:lastChange = Get-Date
+              Log "Window [$($Window.Process)] $($Window.Title)"
+              Log "Text: $text"
+              Log "Buttons: $(Names $buttons)"
+              Log "Choices: $(Names $choices)"
+              [void][CaptureNative]::SetForegroundWindow($Window.Handle)
+              Save-Shot ('page_' + $Window.Title)
+            }
+            if ($Window.Title -match '(?i)\berror\b|failed' -or $allText -match '(?i)fatal error|installation (has )?failed|operating system is not supported|could not install') {
+              throw 'An installer error was detected. The dialog was preserved, not dismissed.'
+            }
+            $writableEdit = $false
+            foreach ($edit in @(Controls $element $CT::Edit)) {
+              $value = $null
+              if ($edit.Current.IsEnabled -and -not $edit.Current.IsOffscreen -and $edit.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value)) {
+                if (-not $value.Current.IsReadOnly) { $writableEdit = $true }
+              }
+            }
+            if ($writableEdit -and $allText -match '(?i)serial number|license key|activation key|registration code') {
+              throw 'A credential or license-entry page requires manual review. No placeholder key will be entered.'
+            }
+
+            $agreementPage = $Window.Title -match '(?i)license agreement' -or (Names $choices) -match '(?i)I accept the|I agree to'
+            $isReboot = -not $agreementPage -and $allText -match '(?i)(restart|reboot).{0,80}(computer|system|now)|restart your|reboot your'
+            $noRestartConfirmed = $false
+            if ($isReboot) {
+              foreach ($choice in $choices) {
+                $name = Clean-Name $choice.Current.Name
+                if ($name -match '(?i)^(No\b.*|.*restart.*later.*|.*reboot.*later.*|Do not restart.*)$') {
+                  Save-Shot 'before_select_restart_later'
+                  $changed = Select-Choice $choice
+                  $noRestartConfirmed = $true
+                  if ($changed) { Log "Selected no-restart choice: $name"; Start-Sleep 1; return $true }
+                }
+              }
+              $defer = $buttons | Where-Object { (Clean-Name $_.Current.Name) -match '(?i)^(No|Restart later|Reboot later|Later)$' } | Select-Object -First 1
+              if ($defer) {
+                Save-Shot 'before_defer_restart'
+                $method = Invoke-Control $defer $Window.Handle
+                Log "Deferred restart via $method"; Start-Sleep 2; Save-Shot 'after_defer_restart'; return $true
+              }
+              if (-not $noRestartConfirmed) { throw 'Restart requested, but no explicit safe defer choice was identified.' }
+            }
+
+            foreach ($choice in $choices) {
+              $name = Clean-Name $choice.Current.Name
+              $positive = $name -match '(?i)^(I accept\b|I agree\b|Yes,? I accept\b|Accept the terms\b)'
+              $negative = $name -match '(?i)do not|don.t|disagree|not accept'
+              if ($positive -and -not $negative) {
+                if ($env:ACCEPT_LICENSE -ne 'true') { throw 'Agreement page reached without authorization to accept the license.' }
+                Save-Shot 'before_accept_terms'
+                if (Select-Choice $choice) { Log "Selected agreement: $name"; Start-Sleep 1; Save-Shot 'after_accept_terms'; return $true }
+              }
+            }
+
+            $order = @('Install', 'Next', 'Finish', 'Continue')
+            if ($allText -match '(?i)license agreement|end.user license') {
+              if ($env:ACCEPT_LICENSE -eq 'true') { $order = @('I Agree', 'I Accept', 'Agree', 'Accept') + $order }
+              else { throw 'License page requires explicit dispatch authorization.' }
+            }
+            if ($Window.Title -match '(?i)^(Choose|Select) Setup Language$') { $order = @('OK') }
+            if ($isReboot) { $order = @('Finish') }
+            foreach ($wanted in $order) {
+              $button = $buttons | Where-Object { (Clean-Name $_.Current.Name) -eq $wanted } | Select-Object -First 1
+              if (-not $button) { continue }
+              $key = "$fingerprint|$wanted"
+              if ($script:clicked.ContainsKey($key)) {
+                $previous = $script:clicked[$key]
+                if (((Get-Date) - $previous.Time).TotalSeconds -lt 10) { return $false }
+                if ($previous.Count -ge 3) { throw 'The same action was attempted three times without a page transition.' }
+                $count = $previous.Count + 1
+              } else { $count = 1 }
+              Save-Shot ('before_' + $wanted)
+              $method = Invoke-Control $button $Window.Handle
+              $script:clicked[$key] = @{ Time = Get-Date; Count = $count }
+              Log "Clicked [$wanted] via $method on [$($Window.Title)]"
+              Start-Sleep 2; Save-Shot ('after_' + $wanted)
+              return $true
+            }
+            $progress = @(Controls $element $CT::ProgressBar)
+            if ($progress.Count -eq 0 -and ((Get-Date) - $script:lastChange).TotalSeconds -gt 120) {
+              throw 'Unrecognized or blocked page unchanged for 120 seconds. Inspect its text and screenshots before adding a specific rule.'
+            }
+            return $false
+          }
+
+          $recorder = Start-Capture 'setup'
+          try {
+            Save-Shot 'before_setup'
+            $setup = Start-Process -FilePath $env:SETUP_EXE -WorkingDirectory $env:PKG_DIR -PassThru
+            try { $script:family[$setup.Id] = $setup.StartTime.ToUniversalTime() }
+            catch { $script:family[$setup.Id] = $started.ToUniversalTime() }
+            Log "Installer started: pid=$($setup.Id)"
+            $deadline = (Get-Date).AddMinutes([int]$env:SETUP_TIMEOUT_MIN)
+            $quietSince = $null; $completed = $false
+            while ((Get-Date) -lt $deadline) {
+              Minimize-RunnerConsole
+              $windows = @(Installer-Windows)
+              $busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+                $script:family.ContainsKey($_.Id) -and $_.ProcessName -match '^(setup|setup64|ISBEW64|IDriver|IDriver2|ikernel|install|jre.*|vjredist)$'
+              })
+              $setup.Refresh()
+              if ($setup.HasExited -and $windows.Count -eq 0 -and $busy.Count -eq 0) {
+                if (-not $quietSince) { $quietSince = Get-Date }
+                if (((Get-Date) - $quietSince).TotalSeconds -ge 10) { $completed = $true; break }
+              } else { $quietSince = $null }
+              foreach ($window in $windows) { if (Handle-Window $window) { break } }
+              Start-Sleep -Milliseconds 700
+            }
+            if (-not $completed) { throw 'Installer reached its configured timeout. Completion is not assumed.' }
+            if ($setup.ExitCode -ne 0) { throw "Setup bootstrapper exited with code $($setup.ExitCode). Review the logs before launching the app." }
+            Save-Shot 'after_setup'
+            Get-InstalledApps | ConvertTo-Json -Depth 3 | Set-Content "$env:OUT\logs\installed-after.json" -Encoding UTF8
+            Assert-Dependencies
+
+            # Prefer a real Start-menu target over the first EXE in a vendor directory.
+            $shortcutRoots = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs")
+            $shell = New-Object -ComObject WScript.Shell
+            $targets = @()
+            foreach ($link in @(Get-ChildItem -Path $shortcutRoots -Filter *.lnk -Recurse -File -ErrorAction SilentlyContinue)) {
+              if ($link.BaseName -notmatch '(?i)^Scenarist\s*BD(?:\s+[0-9.]+)?$') { continue }
+              $shortcut = $shell.CreateShortcut($link.FullName)
+              $leaf = [IO.Path]::GetFileName($shortcut.TargetPath)
+              if ($leaf -match '(?i)^Scenarist.*\.exe$' -and $leaf -notmatch '(?i)unins|setup|license|helper|update|crash' -and (Test-Path -LiteralPath $shortcut.TargetPath)) {
+                $targets += [pscustomobject]@{ Path = $shortcut.TargetPath; Arguments = $shortcut.Arguments }
+              }
+            }
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+            if ($targets.Count -eq 0) {
+              $locations = @(Get-InstalledApps | Where-Object { $_.DisplayName -match '(?i)Scenarist.*BD' -and $_.InstallLocation } | Select-Object -ExpandProperty InstallLocation -Unique)
+              foreach ($location in $locations) {
+                foreach ($file in @(Get-ChildItem -LiteralPath $location -Filter Scenarist*.exe -Recurse -File -ErrorAction SilentlyContinue)) {
+                  if ($file.Name -match '(?i)^Scenarist(?:\s*BD)?\.exe$') { $targets += [pscustomobject]@{ Path = $file.FullName; Arguments = '' } }
+                }
+              }
+            }
+            $targets = @($targets | Sort-Object Path, Arguments -Unique)
+            $targets | ConvertTo-Json -Depth 3 | Set-Content "$env:OUT\logs\launch-candidates.json" -Encoding UTF8
+            if ($targets.Count -ne 1) { throw "Main executable not uniquely identified ($($targets.Count) candidates). No helper EXE was launched." }
+            $target = $targets[0]
+            Log "Application target: $($target.Path)"
+            $existing = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $target.Path -and $_.SessionId -eq $session })
+            if ($existing.Count -gt 0) { $application = $existing[0] }
+            else {
+              $arguments = @{ FilePath = $target.Path; WorkingDirectory = (Split-Path $target.Path); PassThru = $true }
+              if ($target.Arguments) { $arguments.ArgumentList = $target.Arguments }
+              $application = Start-Process @arguments
+            }
+            for ($index = 1; $index -le 40; $index++) {
+              Start-Sleep -Seconds 3
+              foreach ($window in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+                try {
+                  if ($window.Current.ProcessId -ne $application.Id) { continue }
+                  [void][CaptureNative]::SetForegroundWindow([IntPtr]$window.Current.NativeWindowHandle)
+                  $pattern = $null
+                  if ($window.TryGetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern, [ref]$pattern) -and $pattern.Current.CanMaximize -and $window.Current.Name -match '(?i)Scenarist') {
+                    $pattern.SetWindowVisualState([System.Windows.Automation.WindowVisualState]::Maximized)
+                  }
+                  if ($index % 10 -eq 0) { Log "App window [$($window.Current.Name)]: $(Names (Controls $window $CT::Text))" }
+                } catch { Log "App window inspection: $($_.Exception.Message)" }
+              }
+              if ($index -in @(1, 3, 10, 20, 40)) { Save-Shot ('app_{0:D2}' -f $index) }
+            }
+            Log 'App observation finished. Screenshots may show a license or compatibility dialog rather than the main UI.'
+          } catch {
+            Log "Installer/application stage stopped: $($_.Exception.Message)"
+            try { Save-Shot 'installation_or_launch_failure' } catch { Log 'Failure screenshot could not be captured.' }
+            throw
+          } finally { Stop-Capture $recorder }
+
+      - name: 05 Upload screenshots and diagnostics
         if: always()
-        uses: actions/upload-artifact@v7
+        timeout-minutes: 10
+        uses: actions/upload-artifact@v7.0.2
         with:
-          name: scenarist-bd-screenshots-${{ github.run_number }}
-          path: out
+          name: scenarist-bd-screenshots-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ env.OUT }}
           if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
