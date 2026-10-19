@@ -162,7 +162,7 @@ jobs:
         env:
           SETUP_TIMEOUT_MIN: ${{ inputs.setup_timeout_min || '35' }}
         run: |
-          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing, WindowsBase, UIAutomationClient, UIAutomationTypes
           Add-Type -TypeDefinition @'
           using System;
           using System.Text;
@@ -232,16 +232,12 @@ jobs:
             [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
             [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
             [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+            [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
             [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] public static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
             [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
             [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
             [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e);
             [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-
-            [DllImport("user32.dll", EntryPoint="PostMessageW",
-              ExactSpelling=true, SetLastError=true)]
-            private static extern bool PostMessage(
-              IntPtr h, uint message, IntPtr wParam, IntPtr lParam);
 
             [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW",
               ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
@@ -329,14 +325,6 @@ jobs:
               SendMessage(h, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
             }
 
-            public static bool QueueClick(IntPtr h) {
-              return PostMessage(h, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
-            }
-
-            public static bool RequestClose(IntPtr h) {
-              return PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero);
-            }
-
             public static bool IsRadio(IntPtr h) {
               long style = (long)GetWindowLongPtr(h, GWL_STYLE);
               int t = (int)(style & 0xF);
@@ -347,6 +335,13 @@ jobs:
               RECT r;
               GetWindowRect(h, out r);
               SetCursorPos((r.Left + r.Right) / 2, (r.Top + r.Bottom) / 2);
+              mouse_event(2, 0, 0, 0, UIntPtr.Zero);
+              mouse_event(4, 0, 0, 0, UIntPtr.Zero);
+            }
+
+            public static void ClickAt(int x, int y) {
+              SetCursorPos(x, y);
+              System.Threading.Thread.Sleep(120);
               mouse_event(2, 0, 0, 0, UIntPtr.Zero);
               mouse_event(4, 0, 0, 0, UIntPtr.Zero);
             }
@@ -407,7 +402,7 @@ jobs:
 
           $shots = "$env:OUT\shots"
           $log = "$env:OUT\logs\setup-ui.txt"
-          $script:runStarted = Get-Date
+          $script:runStart = Get-Date
 
           function L($m) {
             $s = "[$(Get-Date -f HH:mm:ss.fff)] $m"
@@ -416,8 +411,6 @@ jobs:
           }
 
           function Shot($tag) {
-            $b = $null
-            $g = $null
             try {
               $r = [System.Windows.Forms.SystemInformation]::VirtualScreen
               $b = New-Object System.Drawing.Bitmap $r.Width, $r.Height
@@ -429,25 +422,20 @@ jobs:
                 "$shots\K_$(Get-Date -f HHmmss_fff)_$t.png",
                 [System.Drawing.Imaging.ImageFormat]::Png
               )
+              $g.Dispose()
+              $b.Dispose()
             }
             catch {
               L "screenshot failed: $($_.Exception.Message)"
             }
-            finally {
-              if ($g) { $g.Dispose() }
-              if ($b) { $b.Dispose() }
-            }
           }
 
           # Keep the existing 1.5-second screenshot timeline.
-          Remove-Item "$shots\STOP" -Force -ErrorAction SilentlyContinue
           $job = Start-Job -ArgumentList $shots -ScriptBlock {
             param($d)
             Add-Type -AssemblyName System.Windows.Forms, System.Drawing
             $i = 0
             while (-not (Test-Path "$d\STOP")) {
-              $b = $null
-              $g = $null
               try {
                 $r = [System.Windows.Forms.SystemInformation]::VirtualScreen
                 $b = New-Object System.Drawing.Bitmap $r.Width, $r.Height
@@ -457,12 +445,10 @@ jobs:
                   ("$d\F_{0:D4}_{1}.jpg" -f (++$i), (Get-Date -f HHmmss)),
                   [System.Drawing.Imaging.ImageFormat]::Jpeg
                 )
+                $g.Dispose()
+                $b.Dispose()
               }
               catch {}
-              finally {
-                if ($g) { $g.Dispose() }
-                if ($b) { $b.Dispose() }
-              }
               Start-Sleep -Milliseconds 1500
             }
           }
@@ -471,7 +457,7 @@ jobs:
 
           $installerProcs = '^(setup|setup64|msiexec|ISBEW64|IDriver|IDriver2|_isdel|ikernel|jre.*|javaw|java|vjredist|install|dotnetfx20|isnetfx|dxwebsetup|dxsetup|haspdinst|sentinel.*|scenarist.*)$'
           $titleRx = '(?i)Scenarist|InstallShield|Java|J#|\.NET Framework|Sentinel|HASP|Installer|Install|Program Compatibility|Security Warning|Visual C\+\+'
-          $neverRx = '(?i)cancel|back|exit|abort|restart now|reboot now|remove|repair|modify|print'
+          $neverRx = '(?i)cancel|back|exit|abort|restart now|reboot now|restart my computer now|yes,?\s+i want to restart|remove|repair|modify|print|learn more'
           $acceptRx = '(?i)^\s*&?I\s+accept\b'
           $denyRx = '(?i)do\s+not\s+accept'
           $normalOrder = @(
@@ -489,31 +475,53 @@ jobs:
           $clicked = @{}
           $acceptTries = @{}
           $script:customerTries = @{}
-          $script:stopReason = $null
-          $script:finishClosed = $false
+          $script:pcaTries = @{}
+          $script:pcaGaveUp = @{}
+          $script:pcaClosed = @{}
           $script:finishTries = @{}
-          $script:compatSaved = @{}
-          $script:runtimeSeen = @{}
+          $script:finishConfirmed = $false
+          $script:appExitLogged = $false
+          $script:activationHandled = $false
+          $script:stopReason = $null
 
           function Test-Radio($ctl) {
             try { return [Ui32]::IsRadio($ctl.Hwnd) }
             catch { return $false }
           }
 
-          function Clean-Label([string]$text) {
-            return (($text -replace '&', '') -replace '\s+', ' ').Trim()
+          function Clean-Name([string]$s) {
+            if (-not $s) { return '' }
+            $t = $s.Replace('&', '').Replace('<', '').Replace('>', '').Trim().ToLowerInvariant()
+            while ($t.Contains('  ')) { $t = $t.Replace('  ', ' ') }
+            return $t
           }
 
-          function Wait-WindowGone([IntPtr]$handle, [int]$seconds) {
-            $until = (Get-Date).AddSeconds($seconds)
-            do {
-              if (-not [Ui32]::IsWindow($handle) -or
-                  -not [Ui32]::IsWindowVisible($handle)) {
-                return $true
+          function Test-Alive($hwnd) {
+            return ([Ui32]::IsWindow($hwnd) -and [Ui32]::IsWindowVisible($hwnd))
+          }
+
+          function Dump-Uia($hwnd, [int]$max) {
+            $items = New-Object System.Collections.ArrayList
+            try {
+              $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+              $all = $root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                [System.Windows.Automation.Condition]::TrueCondition
+              )
+              $n = 0
+              foreach ($e in $all) {
+                if ($n -ge $max) { break }
+                $n++
+                $nm = [string]$e.Current.Name
+                if ($nm) {
+                  [void]$items.Add(('{0}:{1}' -f $e.Current.ControlType.ProgrammaticName, $nm))
+                }
               }
-              Start-Sleep -Milliseconds 250
-            } while ((Get-Date) -lt $until)
-            return $false
+            }
+            catch {
+              [void]$items.Add('uia-error: ' + $_.Exception.Message)
+            }
+            return ($items -join ' | ')
           }
 
           function Get-WizardWindows {
@@ -522,324 +530,38 @@ jobs:
             foreach ($t in [Ui32]::Tops()) {
               if (-not $t.Visible) { continue }
               if ([string]::IsNullOrWhiteSpace($t.Txt)) { continue }
-              if ($t.Txt -match 'ProgramData\\GitHub|hosted-compute|Runner\.Listener') {
-                continue
-              }
+              if ($t.Txt -match 'ProgramData\\GitHub|hosted-compute|Runner\.Listener') { continue }
+              if ($script:pcaGaveUp.ContainsKey($t.Hwnd.ToString())) { continue }
 
+              $procName = 'unknown'
               try {
-                $procId = [Ui32]::ProcId($t.Hwnd)
-                $procName = (
-                  Get-Process -Id $procId -ErrorAction Stop
-                ).ProcessName
+                $procName = (Get-Process -Id ([Ui32]::ProcId($t.Hwnd)) -ErrorAction Stop).ProcessName
               }
               catch {
+                $procName = 'unknown'
+              }
+
+              if ($procName -match '^(powershell|pwsh|conhost|WindowsTerminal|explorer|Taskmgr|WmiPrvSE)$') {
                 continue
               }
 
-              $isCompat = $t.Txt -match '(?i)^Program Compatibility Assistant\s*$'
-              if (-not $isCompat -and
-                  $procName -match '(?i)^(pcaui|pcalua)$' -and
-                  $t.Txt -match '(?i)^This app can.t run on this device') {
-                $isCompat = $true
-              }
-
-              if (-not $isCompat -and
-                  $procName -match '^(powershell|pwsh|conhost|WindowsTerminal|explorer|Taskmgr|WmiPrvSE)$') {
-                continue
-              }
-
-              if ($isCompat -or
-                  ($procName -match $installerProcs) -or
-                  ($t.Txt -match $titleRx)) {
+              if (($procName -match $installerProcs) -or ($t.Txt -match $titleRx)) {
                 [void]$res.Add([pscustomobject]@{
                   H = $t.Hwnd
                   Title = $t.Txt
                   Cls = $t.Cls
                   Proc = $procName
-                  ProcessId = $procId
-                  IsCompat = [bool]$isCompat
                 })
               }
             }
 
             return @($res | Sort-Object @{ Expression = {
-              if ($_.IsCompat) { 4 }
-              elseif ($_.Title -eq 'Scenarist BD') { 0 }
+              if ($_.Title -eq 'Scenarist BD') { 0 }
               elseif ($_.Cls -eq '#32770') { 1 }
-              elseif ($_.Title -match '(?i)InstallShield') { 3 }
-              else { 2 }
+              elseif ($_.Title -match '(?i)InstallShield') { 2 }
+              elseif ($_.Title -match '(?i)Program Compatibility') { 4 }
+              else { 3 }
             } })
-          }
-
-          function Save-WindowDetails($win, [string]$tag) {
-            $safeTag = $tag -replace '[^A-Za-z0-9_-]', '_'
-            $file = Join-Path "$env:OUT\logs" (
-              '{0}-{1}-{2}.txt' -f
-                $safeTag, (Get-Date -Format 'HHmmss-fff'), $win.H
-            )
-
-            @(
-              "Captured: $(Get-Date -Format o)"
-              "Title: $($win.Title)"
-              "Class: $($win.Cls)"
-              "HWND: $($win.H)"
-              "Process: $($win.Proc)"
-              "ProcessId: $($win.ProcessId)"
-              ''
-              '=== Process metadata ==='
-            ) | Out-File -LiteralPath $file -Encoding utf8
-
-            try {
-              Get-CimInstance Win32_Process `
-                -Filter "ProcessId=$($win.ProcessId)" `
-                -ErrorAction Stop |
-                Select-Object ProcessId, ParentProcessId, Name,
-                  ExecutablePath, CommandLine, SessionId |
-                Format-List |
-                Out-String -Width 500 |
-                Add-Content -LiteralPath $file -Encoding utf8
-            }
-            catch {
-              "Process metadata unavailable: $($_.Exception.Message)" |
-                Add-Content -LiteralPath $file -Encoding utf8
-            }
-
-            '=== Native child windows ===' |
-              Add-Content -LiteralPath $file -Encoding utf8
-
-            foreach ($c in [Ui32]::Kids($win.H)) {
-              "HWND=$($c.Hwnd) Class='$($c.Cls)' Visible=$($c.Visible) Enabled=$($c.Enabled) Rect=($($c.Left),$($c.Top),$($c.Right),$($c.Bottom)) Text='$($c.Txt)'" |
-                Add-Content -LiteralPath $file -Encoding utf8
-            }
-
-            # Modern compatibility dialogs may expose text only through UIA.
-            # Keep this diagnostic query separate from the working installer code.
-            $dumpJob = $null
-            try {
-              $dumpJob = Start-Job -ArgumentList ($win.H.ToInt64()) -ScriptBlock {
-                param([long]$rawHandle)
-                try {
-                  Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-                  $root = [System.Windows.Automation.AutomationElement]::FromHandle(
-                    [IntPtr]$rawHandle
-                  )
-
-                  "UIA root: $($root.Current.Name)"
-                  $nodes = $root.FindAll(
-                    [System.Windows.Automation.TreeScope]::Descendants,
-                    [System.Windows.Automation.Condition]::TrueCondition
-                  )
-
-                  $count = [Math]::Min($nodes.Count, 150)
-                  for ($n = 0; $n -lt $count; $n++) {
-                    try {
-                      $c = $nodes[$n].Current
-                      "Type=$($c.ControlType.ProgrammaticName) Name='$($c.Name)' Class='$($c.ClassName)' Enabled=$($c.IsEnabled) Offscreen=$($c.IsOffscreen)"
-                    }
-                    catch {}
-                  }
-                }
-                catch {
-                  "UIA diagnostic unavailable: $($_.Exception.Message)"
-                }
-              }
-
-              Wait-Job $dumpJob -Timeout 8 | Out-Null
-              '=== UI Automation diagnostic ===' |
-                Add-Content -LiteralPath $file -Encoding utf8
-              Receive-Job $dumpJob -ErrorAction SilentlyContinue |
-                Out-String -Width 500 |
-                Add-Content -LiteralPath $file -Encoding utf8
-
-              if ($dumpJob.State -ne 'Completed') {
-                "UIA diagnostic state: $($dumpJob.State); query stopped." |
-                  Add-Content -LiteralPath $file -Encoding utf8
-              }
-            }
-            catch {
-              "UIA diagnostic error: $($_.Exception.Message)" |
-                Add-Content -LiteralPath $file -Encoding utf8
-            }
-            finally {
-              if ($dumpJob) {
-                Stop-Job $dumpJob -ErrorAction SilentlyContinue
-                Remove-Job $dumpJob -Force -ErrorAction SilentlyContinue
-              }
-            }
-
-            L ("   window diagnostic saved: {0}" -f $file)
-          }
-
-          function Invoke-InstallerFinish($win, $finishButton) {
-            $key = '{0}|{1}' -f $win.ProcessId, $win.H
-            if (-not $script:finishTries.ContainsKey($key)) {
-              $script:finishTries[$key] = 0
-            }
-            $script:finishTries[$key]++
-            $attempt = [int]$script:finishTries[$key]
-
-            L ("   finish: attempt {0}/3" -f $attempt)
-
-            try {
-              [Ui32]::Focus($win.H)
-              Start-Sleep -Milliseconds 250
-              Shot ("finish_before_{0}" -f $attempt)
-
-              if ($attempt -eq 1) {
-                $queued = [Ui32]::QueueClick($finishButton.Hwnd)
-                L ("   finish: BM_CLICK queued={0}" -f $queued)
-                if (-not $queued) {
-                  throw 'Could not queue the Finish click.'
-                }
-              }
-              else {
-                # Retry only after the previous request failed to close the page.
-                if ([Ui32]::GetForegroundWindow() -ne $win.H -or
-                    -not [Ui32]::CanHit($finishButton.Hwnd)) {
-                  throw 'Finish is not safely reachable for a mouse retry.'
-                }
-
-                L '   finish: retrying with one real mouse click'
-                [Ui32]::RealClick($finishButton.Hwnd)
-              }
-
-              if (Wait-WindowGone $win.H 8) {
-                $script:finishClosed = $true
-                L '   finish: installer window closure confirmed'
-                Shot 'finish_window_closed'
-                return $true
-              }
-
-              throw 'Finish was requested, but the installer window remains visible.'
-            }
-            catch {
-              L ("   finish attempt {0} failed: {1}" -f
-                $attempt, $_.Exception.Message)
-              Shot ("finish_attempt_{0}_failed" -f $attempt)
-
-              if ($attempt -ge 3) {
-                $script:stopReason =
-                  'Finish could not close the installer after three attempts.'
-              }
-            }
-
-            return $true
-          }
-
-          function Close-CompatibilityWindow($win) {
-            if (-not $script:finishClosed) {
-              throw 'Compatibility dismissal is not allowed before Finish closes.'
-            }
-            if (-not $win.IsCompat) {
-              throw 'Refusing to close a window not identified as the compatibility assistant.'
-            }
-
-            if (Wait-WindowGone $win.H 0) {
-              return $true
-            }
-
-            $key = '{0}|{1}' -f $win.ProcessId, $win.H
-            if (-not $script:compatSaved.ContainsKey($key)) {
-              $script:compatSaved[$key] = $true
-              Shot 'compatibility_before_dismissal'
-              Save-WindowDetails $win 'compatibility'
-            }
-
-            [Ui32]::Focus($win.H)
-            Start-Sleep -Milliseconds 250
-
-            $cancel = [Ui32]::Kids($win.H) | Where-Object {
-              $_.Visible -and $_.Enabled -and
-              $_.Cls -match '(?i)^button$' -and
-              (Clean-Label $_.Txt) -eq 'Cancel'
-            } | Select-Object -First 1
-
-            if ($cancel) {
-              L '   compatibility: requesting Cancel on the warning only'
-              $queued = [Ui32]::QueueClick($cancel.Hwnd)
-              L ("   compatibility: Cancel queued={0}" -f $queued)
-
-              if (Wait-WindowGone $win.H 4) {
-                L '   compatibility: warning closure confirmed after Cancel'
-                Shot 'compatibility_closed'
-                return $true
-              }
-            }
-
-            # WM_CLOSE requests the same window-level close action as its X.
-            # Do not send it to the installer, runner, or an arbitrary dialog.
-            L '   compatibility: requesting WM_CLOSE on the warning only'
-            $queued = [Ui32]::RequestClose($win.H)
-            L ("   compatibility: WM_CLOSE queued={0}" -f $queued)
-
-            if (Wait-WindowGone $win.H 6) {
-              L '   compatibility: warning closure confirmed after WM_CLOSE'
-              Shot 'compatibility_closed'
-              return $true
-            }
-
-            L '   compatibility: warning remains visible'
-            Shot 'compatibility_close_failed'
-            return $false
-          }
-
-          function Complete-PostInstallWindows {
-            $until = (Get-Date).AddSeconds(60)
-            $clearSince = $null
-
-            while ((Get-Date) -lt $until) {
-              $windows = @(Get-WizardWindows)
-              $compat = @($windows | Where-Object { $_.IsCompat })
-
-              if ($compat.Count -gt 0) {
-                $clearSince = $null
-                foreach ($w in $compat) {
-                  if (-not (Close-CompatibilityWindow $w)) {
-                    $script:stopReason =
-                      'The compatibility warning could not be closed.'
-                    return $false
-                  }
-                }
-                Start-Sleep -Milliseconds 500
-                continue
-              }
-
-              $installerUi = @($windows | Where-Object {
-                -not $_.IsCompat -and
-                $_.Proc -match '^(setup|setup64|msiexec|ISBEW64|IDriver|IDriver2)$'
-              })
-
-              if ($installerUi.Count -gt 0) {
-                $clearSince = $null
-                if (-not $seen.ContainsKey('postinstall-window')) {
-                  $seen['postinstall-window'] = $true
-                  L '   post-install: waiting for remaining installer UI to close'
-                  foreach ($w in $installerUi) {
-                    L ("   remaining installer: [{0}] {1}" -f
-                      $w.Proc, $w.Title)
-                    Save-WindowDetails $w 'postinstall'
-                  }
-                  Shot 'postinstall_remaining_window'
-                }
-              }
-              else {
-                if ($null -eq $clearSince) {
-                  $clearSince = Get-Date
-                }
-                if (((Get-Date) - $clearSince).TotalSeconds -ge 5) {
-                  L '   post-install: installer and compatibility windows absent for five seconds'
-                  Shot 'postinstall_windows_cleared'
-                  return $true
-                }
-              }
-
-              Start-Sleep 1
-            }
-
-            $script:stopReason =
-              'Installer or compatibility UI did not clear within the post-install deadline.'
-            Shot 'postinstall_cleanup_timeout'
-            return $false
           }
 
           function Find-CustomerField($kids, [string]$labelRegex) {
@@ -941,8 +663,7 @@ jobs:
               $script:customerTries[$key] = 0
             }
 
-            $script:customerTries[$key] =
-              [int]$script:customerTries[$key] + 1
+            $script:customerTries[$key] = [int]$script:customerTries[$key] + 1
             $attempt = [int]$script:customerTries[$key]
 
             if ($attempt -gt 3) {
@@ -1037,31 +758,277 @@ jobs:
               }
             }
 
+            # Suppress the generic Enter/Alt+N fallback on this page.
+            return $true
+          }
+
+          # ---------------------------------------------------------------
+          # Program Compatibility Assistant (PCA) handling.
+          # The dialog is a XAML island: UIA from the top-level HWND only shows
+          # a DesktopWindowXamlSource pane, so buttons are located by hit-testing
+          # points along the bottom button row. "Learn more" is never clicked.
+          # ---------------------------------------------------------------
+          function Get-ButtonFromElement($el) {
+            $cur = $el
+            for ($d = 0; $d -lt 5 -and $cur; $d++) {
+              try {
+                if ($cur.Current.ControlType.ProgrammaticName -eq 'ControlType.Button') { return $cur }
+                $cur = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($cur)
+              }
+              catch { return $null }
+            }
+            return $null
+          }
+
+          function Find-PcaButtons($hwnd, [int]$procId) {
+            $map = @{}
+            $w = [Ui32]::New($hwnd)
+            if (($w.Right - $w.Left) -lt 50 -or ($w.Bottom - $w.Top) -lt 50) { return $map }
+
+            # Hit-test the lower part of the dialog where the buttons live.
+            $rows = @(($w.Bottom - 40), ($w.Bottom - 55), ($w.Bottom - 28), ($w.Bottom - 70))
+            foreach ($y in $rows) {
+              for ($x = ($w.Left + 20); $x -le ($w.Right - 20); $x += 18) {
+                try {
+                  $pt = New-Object System.Windows.Point ([double]$x), ([double]$y)
+                  $el = [System.Windows.Automation.AutomationElement]::FromPoint($pt)
+                  if (-not $el) { continue }
+                  if ($el.Current.ProcessId -ne $procId) { continue }
+                  $btn = Get-ButtonFromElement $el
+                  if (-not $btn) { continue }
+                  $nm = Clean-Name ([string]$btn.Current.Name)
+                  if ($nm -and -not $map.ContainsKey($nm)) { $map[$nm] = $btn }
+                }
+                catch {}
+              }
+            }
+
+            # Also try UIA rooted at each child HWND (XAML content bridge).
+            foreach ($k in [Ui32]::Kids($hwnd)) {
+              try {
+                $root = [System.Windows.Automation.AutomationElement]::FromHandle($k.Hwnd)
+                $cond = New-Object System.Windows.Automation.PropertyCondition(
+                  [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                  [System.Windows.Automation.ControlType]::Button)
+                foreach ($b in @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond))) {
+                  $nm = Clean-Name ([string]$b.Current.Name)
+                  if ($nm -and -not $map.ContainsKey($nm)) { $map[$nm] = $b }
+                }
+              }
+              catch {}
+            }
+
+            return $map
+          }
+
+          function Close-PcaWindow($win) {
+            $key = $win.H.ToString()
+            if ($script:pcaClosed.ContainsKey($key)) { return $false }
+            if (-not $script:pcaTries.ContainsKey($key)) { $script:pcaTries[$key] = 0 }
+            $script:pcaTries[$key] = [int]$script:pcaTries[$key] + 1
+            $n = [int]$script:pcaTries[$key]
+            $procId = [Ui32]::ProcId($win.H)
+
+            if ($n -eq 1) {
+              L ("== [PCA] compatibility warning hwnd={0} title='{1}' pid={2}" -f $key, $win.Title, $procId)
+              try {
+                $p = Get-Process -Id $procId -ErrorAction Stop
+                L ("   PCA process: {0}  path={1}" -f $p.ProcessName, $p.Path)
+              }
+              catch { L '   PCA process: unavailable' }
+              L ("   PCA child windows: {0}" -f (([Ui32]::Kids($win.H) | ForEach-Object {
+                '{0}[{1}]' -f $_.Cls, $_.Txt }) -join ' | '))
+              L ("   PCA uia(root): {0}" -f (Dump-Uia $win.H 60))
+              Shot 'pca_detected'
+            }
+
+            if ($n -gt 3) {
+              if (-not $script:pcaGaveUp.ContainsKey($key)) {
+                $script:pcaGaveUp[$key] = $true
+                L 'PCA: could not dismiss after 3 rounds; excluding it from the wizard loop (does not block the app)'
+                Shot 'pca_gave_up'
+              }
+              return $false
+            }
+
+            $how = 'none'
+
+            # Strategy 1: locate the real Cancel button via hit-testing / child UIA.
+            $btns = Find-PcaButtons $win.H $procId
+            L ("   PCA buttons located: {0}" -f (($btns.Keys | Sort-Object) -join ' | '))
+
+            if ($btns.ContainsKey('cancel')) {
+              $b = $btns['cancel']
+              try {
+                $pat = $null
+                if ($b.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
+                  $pat.Invoke()
+                  $how = 'uia-invoke-cancel'
+                }
+              }
+              catch { L ("   PCA invoke error: {0}" -f $_.Exception.Message) }
+
+              if ($how -eq 'none') {
+                try {
+                  $rc = $b.Current.BoundingRectangle
+                  if ($rc.Width -gt 0 -and $rc.Height -gt 0) {
+                    [Ui32]::Focus($win.H)
+                    Start-Sleep -Milliseconds 200
+                    [Ui32]::ClickAt([int]($rc.X + $rc.Width / 2), [int]($rc.Y + $rc.Height / 2))
+                    $how = 'mouse-cancel'
+                  }
+                }
+                catch { L ("   PCA mouse error: {0}" -f $_.Exception.Message) }
+              }
+
+              if ($how -ne 'none') {
+                Start-Sleep -Milliseconds 1200
+                if (-not (Test-Alive $win.H)) {
+                  $script:pcaClosed[$key] = $true
+                  L ("PCA: dismissed via {0}" -f $how)
+                  Shot 'pca_dismissed'
+                  return $true
+                }
+              }
+            }
+
+            # Strategy 2: system close command (same path as the title-bar X).
+            [void][Ui32]::PostMessage($win.H, 0x0112, [IntPtr]0xF060, [IntPtr]::Zero)
+            Start-Sleep -Milliseconds 1200
+            if (-not (Test-Alive $win.H)) {
+              $script:pcaClosed[$key] = $true
+              L 'PCA: dismissed via SC_CLOSE'
+              Shot 'pca_dismissed'
+              return $true
+            }
+
+            # Strategy 3: Alt+F4 with the dialog focused.
+            [Ui32]::Focus($win.H)
+            Start-Sleep -Milliseconds 250
+            if ([Ui32]::GetForegroundWindow() -eq $win.H) {
+              [void]$wshell.SendKeys('%{F4}')
+              Start-Sleep -Milliseconds 1200
+              if (-not (Test-Alive $win.H)) {
+                $script:pcaClosed[$key] = $true
+                L 'PCA: dismissed via Alt+F4'
+                Shot 'pca_dismissed'
+                return $true
+              }
+            }
+
+            # Strategy 4: plain WM_CLOSE (kept from v4).
+            [void][Ui32]::SendMessage($win.H, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+            Start-Sleep -Milliseconds 1200
+            if (-not (Test-Alive $win.H)) {
+              $script:pcaClosed[$key] = $true
+              L 'PCA: dismissed via WM_CLOSE'
+              Shot 'pca_dismissed'
+              return $true
+            }
+
+            L ("PCA: round {0} finished (last method {1}); still visible" -f $n, $how)
+            Shot ('pca_round_' + $n)
+            return $true
+          }
+
+          function Close-AnyPca {
+            $count = 0
+            foreach ($t in [Ui32]::Tops()) {
+              if ($t.Visible -and $t.Txt -match '(?i)Program Compatibility') {
+                $w = [pscustomobject]@{ H = $t.Hwnd; Title = $t.Txt; Cls = $t.Cls; Proc = 'pca' }
+                [void](Close-PcaWindow $w)
+                if (-not (Test-Alive $t.Hwnd)) { $count++ }
+              }
+            }
+            return $count
+          }
+
+          # Completion page: uncheck optional launch/readme/update items, then click Finish.
+          function Handle-Completion($win, $kids, $buttons, $pageText) {
+            $key = $win.H.ToString()
+            if (-not $script:finishTries.ContainsKey($key)) { $script:finishTries[$key] = 0 }
+
+            # If a restart choice exists, pick the defer option only (never restart now).
+            if ($pageText -match '(?i)restart|reboot') {
+              $defer = $kids | Where-Object {
+                $_.Visible -and $_.Enabled -and $_.Cls -match '(?i)button' -and
+                (Clean-Name $_.Txt) -match '^(no, i will restart.*|restart later|later|no)$'
+              } | Select-Object -First 1
+
+              if ($defer -and [Ui32]::Check($defer.Hwnd) -ne 1) {
+                L ("completion: selecting defer option '{0}'" -f $defer.Txt)
+                [Ui32]::Click($defer.Hwnd)
+                Start-Sleep -Milliseconds 600
+                return $true
+              }
+            }
+
+            # Uncheck optional items so we control the launch ourselves.
+            $optRx = '(?i)Show the Windows Installer log|check for program updates|Show the readme file|Launch the program'
+            $unchecked = $false
+            foreach ($c in $kids) {
+              if ($c.Visible -and $c.Enabled -and $c.Cls -match '(?i)button' -and $c.Txt -match $optRx) {
+                if ([Ui32]::Check($c.Hwnd) -eq 1) {
+                  L ("completion: unchecking optional item '{0}'" -f $c.Txt)
+                  [Ui32]::Click($c.Hwnd)
+                  Start-Sleep -Milliseconds 400
+                  $unchecked = $true
+                }
+              }
+            }
+            if ($unchecked) { return $true }
+
+            $finish = $buttons | Where-Object {
+              $_.Visible -and $_.Enabled -and (Clean-Name $_.Txt) -eq 'finish'
+            } | Select-Object -First 1
+            if (-not $finish) { return $false }
+
+            $script:finishTries[$key] = [int]$script:finishTries[$key] + 1
+            $attempt = [int]$script:finishTries[$key]
+            if ($attempt -gt 6) {
+              $script:stopReason = 'Finish did not close the completion page after six attempts.'
+              return $true
+            }
+
+            L ("completion: clicking Finish (attempt {0})" -f $attempt)
+            Shot 'before_finish'
+            [Ui32]::Focus($win.H)
+            Start-Sleep -Milliseconds 250
+            [Ui32]::Click($finish.Hwnd)
+
+            for ($i = 0; $i -lt 20; $i++) {
+              Start-Sleep -Milliseconds 500
+              if (-not (Test-Alive $win.H)) { break }
+            }
+
+            if (-not (Test-Alive $win.H)) {
+              $script:finishConfirmed = $true
+              L 'completion: Finish confirmed; wizard window closed'
+              Shot 'after_finish'
+            }
+            else {
+              L 'completion: window still visible 10s after Finish; will retry'
+              Shot 'finish_still_visible'
+            }
             return $true
           }
 
           function Invoke-Page($win) {
-            # Compatibility warnings are handled only after Finish closes.
-            if ($win.IsCompat) { return $false }
-
             $winH = $win.H
+
+            if ($win.Title -match '(?i)Program Compatibility') {
+              return (Close-PcaWindow $win)
+            }
+
             [Ui32]::Focus($winH)
             Start-Sleep -Milliseconds 200
             $kids = @([Ui32]::Kids($winH))
             if ($kids.Count -eq 0) { return $false }
 
-            $buttons = @($kids | Where-Object {
-              $_.Cls -match '(?i)^button$'
-            })
-            $textList = @($kids | Where-Object {
-              $_.Txt
-            } | ForEach-Object {
-              $_.Txt
-            })
+            $buttons = @($kids | Where-Object { $_.Cls -match '(?i)^button$' })
+            $textList = @($kids | Where-Object { $_.Txt } | ForEach-Object { $_.Txt })
             $pageText = ($textList -join ' | ')
-            $sig = (($kids | ForEach-Object {
-              $_.Cls + ':' + $_.Txt + ':' + $_.Enabled
-            }) -join ';')
+            $sig = (($kids | ForEach-Object { $_.Cls + ':' + $_.Txt + ':' + $_.Enabled }) -join ';')
             $fp = ('{0}|{1}' -f $winH, $sig)
 
             if (-not $seen.ContainsKey($fp)) {
@@ -1075,55 +1042,35 @@ jobs:
               Shot ('page_' + $win.Title)
             }
 
-            # Finish must be checked BEFORE the broad "installing" wait rule.
-            # Use visible controls to avoid hidden MSI template messages.
-            $finishButton = $buttons | Where-Object {
-              $_.Visible -and $_.Enabled -and
-              (Clean-Label $_.Txt) -eq 'Finish'
-            } | Select-Object -First 1
-
-            if ($win.Title -eq 'Scenarist BD' -and
-                $win.Proc -eq 'msiexec' -and
-                $finishButton) {
-              $visibleText = ($kids | Where-Object {
-                $_.Visible -and $_.Txt
-              } | ForEach-Object {
-                $_.Txt
-              }) -join ' | '
-
-              if ($visibleText -match '(?i)\bsuccessfully installed\b') {
-                return (Invoke-InstallerFinish $win $finishButton)
-              }
-
-              L '   Finish is visible, but installation success text was not confirmed'
-              Shot 'finish_success_not_confirmed'
-              $script:stopReason =
-                'Finish page did not confirm a successful installation.'
-              return $true
-            }
-
             $isCustomer = @($kids | Where-Object {
               $_.Visible -and $_.Txt -eq 'Customer Information'
             }).Count -gt 0
 
-            if ($win.Title -eq 'Scenarist BD' -and
-                $win.Proc -eq 'msiexec' -and
-                $isCustomer) {
+            if ($win.Title -eq 'Scenarist BD' -and $win.Proc -eq 'msiexec' -and $isCustomer) {
               return (Invoke-CustomerPage $win $kids)
             }
 
-            # Preserve the working installation-progress behavior.
-            if ($pageText -match '(?i)installing|copying files|please wait|removing|validating|progress') {
-              return $true
+            $hasAdvance = @($buttons | Where-Object {
+              $_.Visible -and $_.Enabled -and ((Clean-Name $_.Txt) -match '^(next|install|finish|yes|ok)$')
+            }).Count -gt 0
+
+            # Completion page is checked BEFORE the progress check, because its text
+            # ("Setup has finished installing ...") contains the word "installing".
+            $isCompletePage = $pageText -match '(?i)Installer Completed|successfully installed|has finished installing|Click Finish to exit|Setup has finished'
+            if ($isCompletePage) {
+              if (Handle-Completion $win $kids $buttons $pageText) { return $true }
             }
+
+            # Real progress pages: only wait when no advance button is enabled.
+            $isProgress = $pageText -match '(?i)please wait|copying (new )?files|installing drivers|gathering permissions|updating component|publishing assembly|uninstalling|validating|removing|installing scenarist|the program features you selected are being'
+            if ($isProgress -and -not $hasAdvance) { return $true }
 
             if ($pageText -match '(?i)restart|reboot') {
               $laterRadio = $buttons | Where-Object {
                 $_.Enabled -and $_.Txt -match '(?i)later'
               } | Select-Object -First 1
 
-              if ($laterRadio -and
-                  [Ui32]::Check($laterRadio.Hwnd) -ne 1) {
+              if ($laterRadio -and [Ui32]::Check($laterRadio.Hwnd) -ne 1) {
                 L ("   reboot page: selecting '{0}'" -f $laterRadio.Txt)
                 [Ui32]::Click($laterRadio.Hwnd)
                 Start-Sleep -Milliseconds 600
@@ -1180,8 +1127,7 @@ jobs:
                     Start-Sleep -Milliseconds 700
                   }
 
-                  L ("   accept state now: {0}" -f
-                    [Ui32]::Check($acc.Hwnd))
+                  L ("   accept state now: {0}" -f [Ui32]::Check($acc.Hwnd))
                   Shot 'license_accept'
 
                   $kids2 = @([Ui32]::Kids($winH))
@@ -1192,8 +1138,7 @@ jobs:
                   } | Select-Object -First 1
 
                   if ($next2) {
-                    L ("   license accepted, clicking '{0}' immediately" -f
-                      $next2.Txt)
+                    L ("   license accepted, clicking '{0}' immediately" -f $next2.Txt)
                     Shot 'before_next_after_accept'
                     [Ui32]::Click($next2.Hwnd)
                     Start-Sleep 2
@@ -1242,8 +1187,7 @@ jobs:
                 continue
               }
 
-              L ("   clicking '{0}' via BM_CLICK on '{1}'" -f
-                $b.Txt, $win.Title)
+              L ("   clicking '{0}' via BM_CLICK on '{1}'" -f $b.Txt, $win.Title)
               Shot ('click_' + $b.Txt)
               [Ui32]::Focus($winH)
               [Ui32]::Click($b.Hwnd)
@@ -1256,201 +1200,308 @@ jobs:
             return $false
           }
 
-          function Get-MainLaunchInfo {
-            # Read existing shortcuts without creating or saving a new shortcut.
-            $desktopRoots = @(
-              [Environment]::GetFolderPath(
-                [Environment+SpecialFolder]::DesktopDirectory
-              )
-              [Environment]::GetFolderPath(
-                [Environment+SpecialFolder]::CommonDesktopDirectory
-              )
-            ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
-              Select-Object -Unique
+          # Locate the installed main executable: shortcuts first, then uninstall entries, then a Program Files scan.
+          function Find-AppTarget {
+            $found = New-Object System.Collections.ArrayList
+            $wsh = New-Object -ComObject WScript.Shell
 
-            foreach ($root in $desktopRoots) {
-              $links = @(Get-ChildItem -LiteralPath $root -Filter '*.lnk' `
-                -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.BaseName -match '(?i)^Scenarist\s*BD$' })
-
-              foreach ($link in $links) {
-                try {
-                  $shortcut = $wshell.CreateShortcut($link.FullName)
-                  $target = [Environment]::ExpandEnvironmentVariables(
-                    [string]$shortcut.TargetPath
-                  )
-
-                  if ($target -and
-                      $target -match '(?i)\.exe$' -and
-                      $target -notmatch '(?i)\\CRACK\\' -and
-                      (Test-Path -LiteralPath $target -PathType Leaf)) {
-                    $working = [string]$shortcut.WorkingDirectory
-                    if ([string]::IsNullOrWhiteSpace($working) -or
-                        -not (Test-Path -LiteralPath $working)) {
-                      $working = Split-Path -Parent $target
-                    }
-
-                    L ("   launch source: desktop shortcut '{0}'" -f
-                      $link.FullName)
-
-                    return [pscustomobject]@{
-                      Path = $target
-                      Arguments = [string]$shortcut.Arguments
-                      WorkingDirectory = $working
-                    }
-                  }
-                }
-                catch {
-                  L ("   shortcut read failed: {0}" -f $_.Exception.Message)
+            $roots = @(
+              "$env:PUBLIC\Desktop",
+              "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+              "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+              "$env:USERPROFILE\Desktop"
+            )
+            foreach ($r in $roots) {
+              if (-not (Test-Path -LiteralPath $r)) { continue }
+              foreach ($lnk in @(Get-ChildItem -LiteralPath $r -Filter *.lnk -Recurse -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -match '(?i)scenarist' })) {
+                $sc = $wsh.CreateShortcut($lnk.FullName)
+                if ($sc.TargetPath -and (Test-Path -LiteralPath $sc.TargetPath)) {
+                  [void]$found.Add([pscustomobject]@{
+                    Source = 'shortcut:' + $lnk.Name
+                    Path = $sc.TargetPath
+                    Args = $sc.Arguments
+                  })
                 }
               }
             }
 
-            # Fallback: only consider application names, not arbitrary tools.
-            $cands = @(Get-ChildItem `
-              'C:\Program Files', 'C:\Program Files (x86)' `
-              -Recurse -Filter '*.exe' -ErrorAction SilentlyContinue |
-              Where-Object {
-                $_.FullName -match '(?i)scenarist' -and
-                $_.FullName -notmatch '(?i)\\CRACK\\' -and
-                $_.Name -match '(?i)^Scenarist(?:\s*BD)?\.exe$'
-              })
-
-            $cands | ForEach-Object {
-              L ("   candidate main program: {0}" -f $_.FullName)
-            }
-
-            $main = $cands | Sort-Object `
-              @{ Expression = {
-                if ($_.Name -match '(?i)^Scenarist\s*BD\.exe$') { 0 }
-                else { 1 }
-              } },
-              @{ Expression = {
-                if ($_.FullName -match '(?i)\\AuthoringApplication\\') { 0 }
-                else { 1 }
-              } },
-              FullName |
-              Select-Object -First 1
-
-            if ($main) {
-              return [pscustomobject]@{
-                Path = $main.FullName
-                Arguments = ''
-                WorkingDirectory = $main.DirectoryName
+            $regRoots = @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+            )
+            foreach ($app in @(Get-ItemProperty $regRoots -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -match '(?i)scenarist' -and $_.InstallLocation })) {
+              if (Test-Path -LiteralPath $app.InstallLocation) {
+                foreach ($exe in @(Get-ChildItem -LiteralPath $app.InstallLocation -Filter *.exe -File -Recurse -ErrorAction SilentlyContinue)) {
+                  [void]$found.Add([pscustomobject]@{
+                    Source = 'uninstall:' + $app.DisplayName
+                    Path = $exe.FullName
+                    Args = ''
+                  })
+                }
               }
             }
 
-            return $null
+            if ($found.Count -eq 0) {
+              foreach ($exe in @(Get-ChildItem -LiteralPath 'C:\Program Files','C:\Program Files (x86)' -Recurse -Filter *.exe -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match '(?i)scenarist' })) {
+                [void]$found.Add([pscustomobject]@{
+                  Source = 'scan'
+                  Path = $exe.FullName
+                  Args = ''
+                })
+              }
+            }
+
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wsh)
+
+            $seenPaths = @{}
+            $uniq = New-Object System.Collections.ArrayList
+            foreach ($f in $found) {
+              $p = [string]$f.Path
+              if ($p -notmatch '(?i)scenarist') { continue }
+              if ($p -match '(?i)unins|setup|crash|update|helper|license|dotnet|isnetfx|vjredist') { continue }
+              if (-not (Test-Path -LiteralPath $p)) { continue }
+              if ($seenPaths.ContainsKey($p)) { continue }
+              $seenPaths[$p] = $true
+              [void]$uniq.Add($f)
+            }
+
+            return @($uniq | Sort-Object @{ Expression = {
+              $n = [IO.Path]::GetFileName([string]$_.Path)
+              if ($n -match '(?i)^Scenarist\s*BD\.exe$') { 0 }
+              elseif ($n -match '(?i)^Scenarist\.exe$') { 1 }
+              elseif ($n -match '(?i)^Scenarist') { 2 }
+              else { 3 }
+            } })
           }
 
-          function Record-RuntimeWindows {
-            foreach ($top in [Ui32]::Tops()) {
-              if ([string]::IsNullOrWhiteSpace($top.Txt)) { continue }
+          # ---------------------------------------------------------------
+          # Activation window: log it, click only "Close", then observe what the
+          # application does next. "Create" and "Activate" are never clicked.
+          # ---------------------------------------------------------------
+          function Close-ActivationWindow($top, $kids) {
+            if ($script:activationHandled) { return }
+            $script:activationHandled = $true
 
-              try {
-                $procId = [Ui32]::ProcId($top.Hwnd)
-                $procName = (
-                  Get-Process -Id $procId -ErrorAction Stop
-                ).ProcessName
+            $closeBtn = $kids | Where-Object {
+              $_.Visible -and $_.Enabled -and $_.Cls -match '(?i)button' -and
+              (Clean-Name $_.Txt) -eq 'close'
+            } | Select-Object -First 1
+
+            if (-not $closeBtn) {
+              L 'activation: no enabled Close button found; leaving the window open'
+              return
+            }
+
+            L ("activation: clicking Close (hwnd={0})" -f $closeBtn.Hwnd)
+            Shot 'activation_before_close'
+            [Ui32]::Focus($top.Hwnd)
+            Start-Sleep -Milliseconds 250
+            [Ui32]::Click($closeBtn.Hwnd)
+
+            $gone = $false
+            for ($i = 0; $i -lt 20; $i++) {
+              Start-Sleep -Milliseconds 500
+              if (-not (Test-Alive $top.Hwnd)) { $gone = $true; break }
+            }
+
+            if (-not $gone -and [Ui32]::CanHit($closeBtn.Hwnd)) {
+              L 'activation: BM_CLICK did not close it; trying a real mouse click on Close'
+              [Ui32]::Focus($top.Hwnd)
+              Start-Sleep -Milliseconds 200
+              [Ui32]::RealClick($closeBtn.Hwnd)
+              for ($i = 0; $i -lt 10; $i++) {
+                Start-Sleep -Milliseconds 500
+                if (-not (Test-Alive $top.Hwnd)) { $gone = $true; break }
               }
-              catch {
-                continue
+            }
+
+            L ("activation: window closed={0}" -f $gone)
+            Shot 'activation_after_close'
+
+            Start-Sleep -Seconds 3
+            $alive = @(Get-Process -Name 'ScenaristBD' -ErrorAction SilentlyContinue)
+            if ($alive.Count -eq 0) {
+              L 'activation: ScenaristBD.exe exited after Close (no license installed; main UI is not reachable without a v2c license)'
+            }
+            else {
+              $titles = @($alive | ForEach-Object { $_.MainWindowTitle } | Where-Object { $_ })
+              L ("activation: ScenaristBD.exe still running; main window title(s): {0}" -f ($titles -join ' | '))
+            }
+            Shot 'after_activation_close_state'
+          }
+
+          # Observe the launched application for about two minutes. Record and screenshot new windows.
+          function Observe-App($app) {
+            $seenWin = @{}
+            $seenProc = ''
+            $quietRounds = 0
+
+            for ($i = 1; $i -le 40; $i++) {
+              Start-Sleep -Seconds 3
+
+              $procs = @(Get-Process -ErrorAction SilentlyContinue |
+                Where-Object { $_.ProcessName -match '(?i)scenarist|hasp|sentinel' } |
+                ForEach-Object { '{0}({1})' -f $_.ProcessName, $_.Id })
+              $procSig = $procs -join ','
+              if ($procSig -ne $seenProc) {
+                L ("app phase: relevant processes = [{0}]" -f $procSig)
+                $seenProc = $procSig
               }
 
-              if ($procName -match '^(powershell|pwsh|conhost|WindowsTerminal|explorer)$') {
-                continue
+              if ($app.HasExited -and -not $script:appExitLogged) {
+                $script:appExitLogged = $true
+                L ("app phase: launcher process exited, code={0}" -f $app.ExitCode)
               }
 
-              if ($procName -notmatch '(?i)^scenarist|^pcaui$|^pcalua$|^werfault$' -and
-                  $top.Txt -notmatch '(?i)scenarist|license|sentinel|hasp|compatibility|error') {
-                continue
+              $newWins = 0
+              foreach ($t in [Ui32]::Tops()) {
+                if (-not $t.Visible -or [string]::IsNullOrWhiteSpace($t.Txt)) { continue }
+                if ($t.Txt -match 'Program Compatibility') { continue }
+                if ($t.Txt -match 'ProgramData\\GitHub|hosted-compute|Runner\.Listener') { continue }
+
+                $pn = 'unknown'
+                try { $pn = (Get-Process -Id ([Ui32]::ProcId($t.Hwnd)) -ErrorAction Stop).ProcessName } catch {}
+
+                $isAppRelated = ($pn -match '(?i)scenarist|hasp|sentinel') -or
+                  ($t.Txt -match '(?i)Scenarist|HASP|Sentinel|licen|error|warning|evaluat|dongle|activat|trial')
+                if (-not $isAppRelated) { continue }
+
+                $kids = @([Ui32]::Kids($t.Hwnd))
+                $texts = ($kids | Where-Object { $_.Txt } | ForEach-Object { $_.Txt }) -join ' | '
+                $btns = ($kids | Where-Object { $_.Cls -match '(?i)button' } | ForEach-Object {
+                  '{0}[en={1}]' -f $_.Txt, $_.Enabled
+                }) -join ' | '
+
+                $wsig = '{0}|{1}|{2}' -f $t.Hwnd, $t.Txt, $texts
+                if (-not $seenWin.ContainsKey($wsig)) {
+                  $seenWin[$wsig] = $true
+                  $newWins++
+                  L ("app window: title='{0}' class='{1}' proc='{2}'" -f $t.Txt, $t.Cls, $pn)
+                  L ("   texts: {0}" -f $texts)
+                  L ("   buttons: {0}" -f $btns)
+                  L ("   uia: {0}" -f (Dump-Uia $t.Hwnd 80))
+                  Shot ('app_window_' + $t.Txt)
+                }
+
+                # New: close the activation dialog once, then keep observing.
+                if ($pn -match '(?i)^scenaristbd$' -and
+                    $t.Txt -match '(?i)^Scenarist Activation$' -and
+                    -not $script:activationHandled) {
+                  Close-ActivationWindow $t $kids
+                  $newWins++
+                }
               }
 
-              $texts = ([Ui32]::Kids($top.Hwnd) | Where-Object {
-                $_.Visible -and $_.Txt
-              } | ForEach-Object {
-                $_.Txt
-              }) -join ' | '
-
-              $key = '{0}|{1}|{2}|{3}' -f
-                $top.Hwnd, $procId, $top.Txt, $texts
-
-              if ($script:runtimeSeen.ContainsKey($key)) { continue }
-              $script:runtimeSeen[$key] = $true
-
-              L ("   runtime window: [{0}] '{1}'" -f $procName, $top.Txt)
-              L ("   runtime visible text: {0}" -f $texts)
-
-              $win = [pscustomobject]@{
-                H = $top.Hwnd
-                Title = $top.Txt
-                Cls = $top.Cls
-                Proc = $procName
-                ProcessId = $procId
+              # After the activation dialog is handled, deal with the PCA warning.
+              if ($script:activationHandled) {
+                $pcaClosedNow = Close-AnyPca
+                if ($pcaClosedNow -gt 0) { L ("app phase: closed {0} PCA window(s)" -f $pcaClosedNow) }
               }
 
-              Shot 'runtime_new_window'
-              Save-WindowDetails $win 'runtime'
+              Shot ('app_obs_{0:D2}' -f $i)
+
+              if ($app.HasExited -and $newWins -eq 0) { $quietRounds++ } else { $quietRounds = 0 }
+              if ($quietRounds -ge 5) {
+                L 'app phase: launcher exited and no new windows; stopping observation'
+                break
+              }
             }
           }
 
-          function Save-DriverEvidence {
-            $file = "$env:OUT\logs\driver-and-event-evidence.txt"
-            "Collected: $(Get-Date -Format o)" |
-              Out-File -LiteralPath $file -Encoding utf8
+          # Read-only evidence about why the driver was blocked. Nothing is changed.
+          function Save-Evidence {
+            $f = "$env:OUT\logs\environment-evidence.txt"
+            $lines = New-Object System.Collections.ArrayList
+            [void]$lines.Add('Collected: ' + (Get-Date -Format o))
 
-            '=== Relevant system drivers; read-only query ===' |
-              Add-Content -LiteralPath $file -Encoding utf8
+            [void]$lines.Add('=== Device Guard / Memory integrity (Win32_DeviceGuard) ===')
+            try {
+              $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop
+              [void]$lines.Add(('VirtualizationBasedSecurityStatus: {0}  (0=off 1=enabled 2=running)' -f $dg.VirtualizationBasedSecurityStatus))
+              [void]$lines.Add(('SecurityServicesConfigured: {0}' -f (@($dg.SecurityServicesConfigured) -join ',')))
+              [void]$lines.Add(('SecurityServicesRunning: {0}  (2 = HVCI / Memory integrity running)' -f (@($dg.SecurityServicesRunning) -join ',')))
+              [void]$lines.Add(('CodeIntegrityPolicyEnforcementStatus: {0}' -f $dg.CodeIntegrityPolicyEnforcementStatus))
+            }
+            catch { [void]$lines.Add('Win32_DeviceGuard unavailable: ' + $_.Exception.Message) }
 
             try {
-              Get-CimInstance Win32_SystemDriver -ErrorAction Stop |
-                Where-Object {
-                  $_.Name -match '(?i)^aks|hasp|hardlock|sentinel' -or
-                  $_.DisplayName -match '(?i)hasp|hardlock|sentinel|safenet|aladdin' -or
-                  $_.PathName -match '(?i)hasp|hardlock|sentinel|aksdf|aksfridge'
-                } |
-                Select-Object Name, DisplayName, State, Status,
-                  StartMode, PathName |
-                Format-List |
-                Out-String -Width 500 |
-                Add-Content -LiteralPath $file -Encoding utf8
+              $hv = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' -ErrorAction Stop
+              [void]$lines.Add(('HVCI registry Enabled: {0}' -f $hv.Enabled))
             }
-            catch {
-              "Driver query unavailable: $($_.Exception.Message)" |
-                Add-Content -LiteralPath $file -Encoding utf8
+            catch { [void]$lines.Add('HVCI registry key not present') }
+
+            [void]$lines.Add('=== Boot configuration (test signing) ===')
+            try {
+              $bcd = (& bcdedit.exe /enum '{current}' 2>&1) | Out-String
+              foreach ($ln in ($bcd -split "`r?`n")) {
+                if ($ln -match '(?i)testsigning|nointegritychecks|hypervisorlaunchtype') { [void]$lines.Add($ln.Trim()) }
+              }
+            }
+            catch { [void]$lines.Add('bcdedit unavailable: ' + $_.Exception.Message) }
+
+            [void]$lines.Add('=== Driver services matching HASP / Sentinel / Aladdin ===')
+            try {
+              $drv = @(Get-CimInstance Win32_SystemDriver -ErrorAction Stop | Where-Object {
+                $_.Name -match '(?i)^aks|hasp|hardlock|sentinel' -or
+                $_.DisplayName -match '(?i)hasp|hardlock|sentinel|safenet|aladdin' -or
+                $_.PathName -match '(?i)hasp|hardlock|sentinel|aksdf|aksfridge|akshasp'
+              })
+              if ($drv.Count -eq 0) { [void]$lines.Add('(none registered)') }
+              foreach ($d in $drv) {
+                [void]$lines.Add(('{0} | {1} | State={2} | Start={3} | {4}' -f $d.Name, $d.DisplayName, $d.State, $d.StartMode, $d.PathName))
+              }
+            }
+            catch { [void]$lines.Add('driver query failed: ' + $_.Exception.Message) }
+
+            [void]$lines.Add('=== Driver files in System32\drivers ===')
+            foreach ($pat in @('aks*.sys', 'hardlock*.sys', 'hasp*.sys', 'sntnl*.sys', 'sentinel*.sys')) {
+              foreach ($fi in @(Get-ChildItem "$env:windir\System32\drivers" -Filter $pat -File -ErrorAction SilentlyContinue)) {
+                [void]$lines.Add(('{0}  {1} bytes  {2}' -f $fi.Name, $fi.Length, $fi.VersionInfo.FileVersion))
+              }
             }
 
-            foreach ($channel in @(
-              'Application',
+            [void]$lines.Add('=== Installed programs matching Sentinel / HASP / Scenarist ===')
+            foreach ($app in @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -match '(?i)sentinel|hasp|safenet|aladdin|scenarist' })) {
+              [void]$lines.Add(('{0} | {1} | {2}' -f $app.DisplayName, $app.DisplayVersion, $app.Publisher))
+            }
+
+            [void]$lines.Add('=== PCA-related processes ===')
+            foreach ($p in @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '(?i)^pca' })) {
+              [void]$lines.Add(('{0}({1}) {2}' -f $p.ProcessName, $p.Id, $p.Path))
+            }
+
+            [void]$lines.Add('=== Events since job start ===')
+            $channels = @(
+              'Microsoft-Windows-Application-Experience/Program-Compatibility-Assistant',
+              'Microsoft-Windows-Application-Experience/Program-Telemetry',
+              'Microsoft-Windows-CodeIntegrity/Operational',
               'System',
-              'Microsoft-Windows-CodeIntegrity/Operational'
-            )) {
-              "=== Event channel: $channel ===" |
-                Add-Content -LiteralPath $file -Encoding utf8
-
+              'Application'
+            )
+            foreach ($ch in $channels) {
+              [void]$lines.Add('--- ' + $ch + ' ---')
               try {
-                $events = @(Get-WinEvent -FilterHashtable @{
-                  LogName = $channel
-                  StartTime = $script:runStarted
-                } -MaxEvents 100 -ErrorAction Stop)
-
-                $events | Where-Object {
-                  $channel -eq 'Microsoft-Windows-CodeIntegrity/Operational' -or
-                  $_.Message -match '(?i)scenarist|hasp|sentinel|safenet|aladdin|hardlock|aksdf|aksfridge'
-                } |
-                  Select-Object -First 40 TimeCreated, Id, ProviderName,
-                    LevelDisplayName, Message |
-                  Format-List |
-                  Out-String -Width 500 |
-                  Add-Content -LiteralPath $file -Encoding utf8
+                $evs = @(Get-WinEvent -FilterHashtable @{ LogName = $ch; StartTime = $script:runStart } -MaxEvents 80 -ErrorAction Stop)
+                $sel = @($evs | Where-Object {
+                  $ch -notmatch '^(System|Application)$' -or
+                  $_.Message -match '(?i)scenarist|hasp|sentinel|safenet|aladdin|hardlock|aks|compatib|driver'
+                } | Select-Object -First 40)
+                if ($sel.Count -eq 0) { [void]$lines.Add('(no matching events)') }
+                foreach ($e in $sel) {
+                  $msg = ([string]$e.Message) -replace '\s+', ' '
+                  if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) + '...' }
+                  [void]$lines.Add(('{0} | Id={1} | {2} | {3} | {4}' -f $e.TimeCreated, $e.Id, $e.ProviderName, $e.LevelDisplayName, $msg))
+                }
               }
-              catch {
-                "No readable matching events: $($_.Exception.Message)" |
-                  Add-Content -LiteralPath $file -Encoding utf8
-              }
+              catch { [void]$lines.Add('channel unavailable: ' + $_.Exception.Message) }
             }
 
-            L ("   driver and event evidence saved: {0}" -f $file)
+            $lines | Out-File -LiteralPath $f -Encoding utf8
+            L ("evidence saved: {0}" -f $f)
           }
 
           try {
@@ -1463,6 +1514,7 @@ jobs:
             $deadline = (Get-Date).AddMinutes([int]$env:SETUP_TIMEOUT_MIN)
             $idle = 0
             $quiet = 0
+            $wizardDone = $false
 
             while ((Get-Date) -lt $deadline) {
               $wins = @(Get-WizardWindows)
@@ -1471,14 +1523,14 @@ jobs:
                 $busy = @(Get-Process -ErrorAction SilentlyContinue |
                   Where-Object {
                     $_.ProcessName -match '^(setup|setup64|ISBEW64|IDriver|IDriver2)$' -or
-                    ($_.ProcessName -eq 'msiexec' -and
-                     $_.MainWindowHandle -ne 0)
+                    ($_.ProcessName -eq 'msiexec' -and $_.MainWindowHandle -ne 0)
                   })
 
                 if ($setup.HasExited -and $busy.Count -eq 0) {
                   $quiet = $quiet + 1
                   if ($quiet -ge 8) {
-                    L 'no installer window and no installer process, ending interaction'
+                    L 'no installer window and no installer process, wizard phase finished'
+                    $wizardDone = $true
                     break
                   }
                 }
@@ -1493,8 +1545,7 @@ jobs:
               $quiet = 0
               $acted = $false
 
-              # Preserve the required order: Finish first, compatibility second.
-              foreach ($w in @($wins | Where-Object { -not $_.IsCompat })) {
+              foreach ($w in $wins) {
                 try {
                   if (Invoke-Page $w) {
                     $acted = $true
@@ -1507,11 +1558,6 @@ jobs:
                 }
               }
 
-              if ($script:finishClosed) {
-                L '   installer phase complete; proceeding to compatibility cleanup'
-                break
-              }
-
               if ($script:stopReason) {
                 L ("automation stopped: {0}" -f $script:stopReason)
                 Shot 'automation_blocked'
@@ -1521,13 +1567,11 @@ jobs:
               if (-not $acted) {
                 $idle = $idle + 1
                 if ($idle -eq 4 -or $idle % 10 -eq 0) {
-                  L ("idle {0}: no recognized action; no blind keys sent" -f
-                    $idle)
+                  L ("idle {0}: no recognized action; no blind keys sent" -f $idle)
                   Shot ('idle_' + $idle)
                 }
                 if ($idle -ge 30) {
-                  $script:stopReason =
-                    'No recognized action on the current installer page.'
+                  $script:stopReason = 'No recognized action on the current installer page.'
                   Shot 'unknown_page_blocked'
                   break
                 }
@@ -1536,123 +1580,82 @@ jobs:
               Start-Sleep 1
             }
 
-            if (-not $script:stopReason -and -not $script:finishClosed) {
-              $script:stopReason =
-                'Installer Finish closure was not confirmed; application launch is skipped.'
-              L $script:stopReason
-              Shot 'finish_not_confirmed'
-            }
-
-            if (-not $script:stopReason) {
-              $cleared = Complete-PostInstallWindows
-              if (-not $cleared -and -not $script:stopReason) {
-                $script:stopReason =
-                  'Post-install windows were not confirmed closed.'
-              }
+            if ((-not $wizardDone) -and ((Get-Date) -ge $deadline)) {
+              L '!! timeout: installation has not finished; inspect the last screenshots and logs'
+              Shot 'setup_timeout'
             }
 
             Shot 'after_setup'
 
+            if ($setup.HasExited) {
+              L ("setup.exe exit code: {0}" -f $setup.ExitCode)
+            }
+            else {
+              L 'setup.exe is still running at the end of the wizard phase'
+            }
+            if ($script:finishConfirmed) { L 'wizard: Finish confirmed' }
+
+            Get-ItemProperty `
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' `
+              -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName } |
+              Sort-Object DisplayName |
+              Select-Object DisplayName, DisplayVersion, InstallLocation |
+              Format-Table -AutoSize |
+              Out-String -Width 300 |
+              Out-File "$env:OUT\logs\installed-programs.txt"
+
             if (-not $script:stopReason) {
-              # Wait briefly for the bootstrapper, not the resident MSI service.
-              if (-not $setup.HasExited) {
-                [void]$setup.WaitForExit(5000)
-              }
-              if ($setup.HasExited) {
-                L ("   setup.exe exit code: {0}" -f $setup.ExitCode)
-              }
-              else {
-                L '   setup.exe is still running, but targeted installation UI is closed'
-              }
+              $targets = @(Find-AppTarget)
 
-              Get-ItemProperty `
-                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' `
-                -EA SilentlyContinue |
-                ? DisplayName |
-                sort DisplayName |
-                select DisplayName, DisplayVersion, InstallLocation |
-                Format-Table -AutoSize |
-                Out-String -Width 300 |
-                Out-File "$env:OUT\logs\installed-programs.txt"
-
-              $launch = Get-MainLaunchInfo
-
-              if (-not $launch) {
-                $script:stopReason =
-                  'The Scenarist BD application executable could not be identified.'
-                L $script:stopReason
+              if ($targets.Count -eq 0) {
+                L 'app: no Scenarist executable found after installation'
                 Shot 'no_main_exe'
               }
               else {
-                $exe = Get-Item -LiteralPath $launch.Path
-                L ("   launching application: {0}" -f $launch.Path)
-                L ("   application version: {0}" -f $exe.VersionInfo.FileVersion)
-                L ("   working directory: {0}" -f $launch.WorkingDirectory)
-                Shot 'before_application_launch'
-
-                $stem = [IO.Path]::GetFileNameWithoutExtension($launch.Path)
-                $existing = @(Get-Process -Name $stem `
-                  -ErrorAction SilentlyContinue | Where-Object {
-                    try { $_.Path -ieq $launch.Path }
-                    catch { $false }
-                  })
-
-                if ($existing.Count -gt 0) {
-                  L ("   application already running; observing PID {0}" -f
-                    $existing[0].Id)
-                }
-                else {
-                  $startArgs = @{
-                    FilePath = $launch.Path
-                    WorkingDirectory = $launch.WorkingDirectory
-                    PassThru = $true
-                    ErrorAction = 'Stop'
-                  }
-                  if (-not [string]::IsNullOrWhiteSpace($launch.Arguments)) {
-                    $startArgs.ArgumentList = $launch.Arguments
-                  }
-
-                  $appProcess = Start-Process @startArgs
-                  L ("   application launch PID: {0}" -f $appProcess.Id)
+                foreach ($c in $targets) {
+                  L ("app candidate: {0}  [{1}]" -f $c.Path, $c.Source)
                 }
 
-                # Observe only. Leave application errors and license dialogs open.
-                $observeUntil = (Get-Date).AddSeconds(120)
-                $frame = 0
+                $target = $targets[0]
+                L ("launching: {0}" -f $target.Path)
 
-                do {
-                  Start-Sleep 3
-                  $frame++
-                  Shot ("main_{0:D2}" -f $frame)
-                  Record-RuntimeWindows
-                } while ((Get-Date) -lt $observeUntil)
+                $startArgs = @{
+                  FilePath = $target.Path
+                  WorkingDirectory = (Split-Path -Parent $target.Path)
+                  PassThru = $true
+                }
+                if ($target.Args) { $startArgs['ArgumentList'] = $target.Args }
 
-                Shot 'main_final'
-                L '   application observation finished; no runtime dialog was auto-dismissed'
+                $app = Start-Process @startArgs
+                Observe-App $app
               }
             }
+
+            # Final attempt on any compatibility warning still open (PCA tries are per-window; reset for the final pass).
+            $script:pcaTries = @{}
+            $script:pcaGaveUp = @{}
+            for ($k = 0; $k -lt 2; $k++) {
+              $remaining = @([Ui32]::Tops() | Where-Object { $_.Visible -and $_.Txt -match '(?i)Program Compatibility' })
+              if ($remaining.Count -eq 0) { break }
+              [void](Close-AnyPca)
+              Start-Sleep -Seconds 2
+            }
+            $stillPca = @([Ui32]::Tops() | Where-Object { $_.Visible -and $_.Txt -match '(?i)Program Compatibility' }).Count
+            L ("final: PCA windows still visible = {0}" -f $stillPca)
+            Shot 'final_desktop'
           }
           catch {
-            L ("step exception: {0}" -f $_.Exception.Message)
-            Shot 'step_exception'
-            throw
+            L ('stage stopped: ' + $_.Exception.Message)
+            try { Shot 'stage_failure' } catch {}
           }
           finally {
-            New-Item "$shots\STOP" -ItemType File -Force |
-              Out-Null
-            Wait-Job $job -Timeout 10 |
-              Out-Null
+            try { Save-Evidence } catch { L ('evidence failed: ' + $_.Exception.Message) }
+            New-Item "$shots\STOP" -ItemType File -Force | Out-Null
+            Wait-Job $job -Timeout 10 | Out-Null
             Stop-Job $job -ErrorAction SilentlyContinue
             Remove-Job $job -Force -ErrorAction SilentlyContinue
-
-            try {
-              Save-DriverEvidence
-            }
-            catch {
-              L ("evidence collection failed: {0}" -f $_.Exception.Message)
-            }
-
             L "total screenshots: $((Get-ChildItem $shots -File).Count)"
           }
 
