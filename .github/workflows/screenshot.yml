@@ -238,6 +238,7 @@ jobs:
             [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
             [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e);
             [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+            [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out RECT rect, int size);
 
             [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW",
               ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
@@ -258,7 +259,8 @@ jobs:
               return b.ToString();
             }
 
-            public static UiCtl New(IntPtr h) {
+            // Renamed from "New": PowerShell treats [Type]::New(...) as a constructor call.
+            public static UiCtl Describe(IntPtr h) {
               var c = new UiCtl();
               c.Hwnd = h;
               c.Cls = ClsOf(h);
@@ -277,7 +279,7 @@ jobs:
             public static List<UiCtl> Tops() {
               var list = new List<UiCtl>();
               EnumWindows(delegate(IntPtr h, IntPtr l) {
-                if (IsWindowVisible(h)) list.Add(New(h));
+                if (IsWindowVisible(h)) list.Add(Describe(h));
                 return true;
               }, IntPtr.Zero);
               return list;
@@ -286,7 +288,7 @@ jobs:
             public static List<UiCtl> Kids(IntPtr parent) {
               var list = new List<UiCtl>();
               EnumChildWindows(parent, delegate(IntPtr h, IntPtr l) {
-                list.Add(New(h));
+                list.Add(Describe(h));
                 return true;
               }, IntPtr.Zero);
               return list;
@@ -344,6 +346,49 @@ jobs:
               System.Threading.Thread.Sleep(120);
               mouse_event(2, 0, 0, 0, UIntPtr.Zero);
               mouse_event(4, 0, 0, 0, UIntPtr.Zero);
+            }
+
+            // Hover first, then press and release with a short hold.
+            // XAML buttons need a pointer-over state before they accept a click.
+            public static void PressAt(int x, int y, int hoverMs, int holdMs) {
+              SetCursorPos(x - 3, y - 2);
+              System.Threading.Thread.Sleep(60);
+              SetCursorPos(x, y);
+              System.Threading.Thread.Sleep(hoverMs);
+              mouse_event(2, 0, 0, 0, UIntPtr.Zero);
+              System.Threading.Thread.Sleep(holdMs);
+              mouse_event(4, 0, 0, 0, UIntPtr.Zero);
+            }
+
+            // Process id that owns the window currently under the screen point.
+            public static int HitPid(int x, int y) {
+              POINT p = new POINT();
+              p.X = x;
+              p.Y = y;
+              IntPtr h = WindowFromPoint(p);
+              if (h == IntPtr.Zero) return -1;
+              uint pid;
+              GetWindowThreadProcessId(h, out pid);
+              return (int)pid;
+            }
+
+            // Visible frame bounds (DWMWA_EXTENDED_FRAME_BOUNDS = 9); falls back to GetWindowRect.
+            public static int[] FrameRect(IntPtr h) {
+              RECT r = new RECT();
+              bool ok = false;
+              try {
+                int hr = DwmGetWindowAttribute(h, 9, out r, Marshal.SizeOf(typeof(RECT)));
+                ok = (hr == 0 && r.Right > r.Left && r.Bottom > r.Top);
+              }
+              catch (Exception) {
+                ok = false;
+              }
+              if (!ok) {
+                RECT r2;
+                if (!GetWindowRect(h, out r2)) return null;
+                r = r2;
+              }
+              return new int[] { r.Left, r.Top, r.Right, r.Bottom };
             }
 
             public static bool CanHit(IntPtr h) {
@@ -430,6 +475,38 @@ jobs:
             }
           }
 
+          # Same as Shot, but draws red crosshairs at two screen points so the click
+          # targets can be checked and re-calibrated from the saved image.
+          function ShotMark([string]$tag, [int]$x1, [int]$y1, [int]$x2, [int]$y2) {
+            try {
+              $r = [System.Windows.Forms.SystemInformation]::VirtualScreen
+              $b = New-Object System.Drawing.Bitmap $r.Width, $r.Height
+              $g = [System.Drawing.Graphics]::FromImage($b)
+              $g.CopyFromScreen($r.Left, $r.Top, 0, 0, $b.Size)
+              $pen = [System.Drawing.Pen]::new([System.Drawing.Color]::Red, [single]3)
+              foreach ($pt in @(@($x1, $y1), @($x2, $y2))) {
+                $px = [int]($pt[0] - $r.Left)
+                $py = [int]($pt[1] - $r.Top)
+                $g.DrawEllipse($pen, ($px - 10), ($py - 10), 20, 20)
+                $g.DrawLine($pen, ($px - 18), $py, ($px + 18), $py)
+                $g.DrawLine($pen, $px, ($py - 18), $px, ($py + 18))
+              }
+              $t = ($tag -replace '[^\w\-]', '_')
+              if ($t.Length -gt 50) { $t = $t.Substring(0, 50) }
+              $b.Save(
+                "$shots\K_$(Get-Date -f HHmmss_fff)_$t.png",
+                [System.Drawing.Imaging.ImageFormat]::Png
+              )
+              $pen.Dispose()
+              $g.Dispose()
+              $b.Dispose()
+            }
+            catch {
+              L ("marked screenshot failed: {0}" -f $_.Exception.Message)
+              Shot $tag
+            }
+          }
+
           # Keep the existing 1.5-second screenshot timeline.
           $job = Start-Job -ArgumentList $shots -ScriptBlock {
             param($d)
@@ -478,6 +555,7 @@ jobs:
           $script:pcaTries = @{}
           $script:pcaGaveUp = @{}
           $script:pcaClosed = @{}
+          $script:pcaSeenAt = @{}
           $script:finishTries = @{}
           $script:finishConfirmed = $false
           $script:appExitLogged = $false
@@ -531,7 +609,8 @@ jobs:
               if (-not $t.Visible) { continue }
               if ([string]::IsNullOrWhiteSpace($t.Txt)) { continue }
               if ($t.Txt -match 'ProgramData\\GitHub|hosted-compute|Runner\.Listener') { continue }
-              if ($script:pcaGaveUp.ContainsKey($t.Hwnd.ToString())) { continue }
+              # The compatibility warning is handled separately (see Close-AnyPca).
+              if ($t.Txt -match '(?i)Program Compatibility') { continue }
 
               $procName = 'unknown'
               try {
@@ -559,7 +638,6 @@ jobs:
               if ($_.Title -eq 'Scenarist BD') { 0 }
               elseif ($_.Cls -eq '#32770') { 1 }
               elseif ($_.Title -match '(?i)InstallShield') { 2 }
-              elseif ($_.Title -match '(?i)Program Compatibility') { 4 }
               else { 3 }
             } })
           }
@@ -663,7 +741,8 @@ jobs:
               $script:customerTries[$key] = 0
             }
 
-            $script:customerTries[$key] = [int]$script:customerTries[$key] + 1
+            $script:customerTries[$key] =
+              [int]$script:customerTries[$key] + 1
             $attempt = [int]$script:customerTries[$key]
 
             if ($attempt -gt 3) {
@@ -764,9 +843,15 @@ jobs:
 
           # ---------------------------------------------------------------
           # Program Compatibility Assistant (PCA) handling.
-          # The dialog is a XAML island: UIA from the top-level HWND only shows
-          # a DesktopWindowXamlSource pane, so buttons are located by hit-testing
-          # points along the bottom button row. "Learn more" is never clicked.
+          # The warning is a XAML island hosted by pcaui.exe: there are no Win32
+          # button children (BM_CLICK is useless) and UIA exposes only a
+          # DesktopWindowXamlSource pane. The reliable route is a real mouse click
+          # at window-relative coordinates, guarded by a hit-test so that only a
+          # window owned by the PCA process can ever receive the click.
+          # "Learn more" is never clicked.
+          # Offsets were calibrated on two 1920x1080 screenshots (PCA window at two
+          # different screen positions): Cancel center = (right-156, bottom-41),
+          # close X = (right-15, top+15), blank body area = (right-120, top+60).
           # ---------------------------------------------------------------
           function Get-ButtonFromElement($el) {
             $cur = $el
@@ -780,153 +865,225 @@ jobs:
             return $null
           }
 
-          function Find-PcaButtons($hwnd, [int]$procId) {
-            $map = @{}
-            $w = [Ui32]::New($hwnd)
-            if (($w.Right - $w.Left) -lt 50 -or ($w.Bottom - $w.Top) -lt 50) { return $map }
-
-            # Hit-test the lower part of the dialog where the buttons live.
-            $rows = @(($w.Bottom - 40), ($w.Bottom - 55), ($w.Bottom - 28), ($w.Bottom - 70))
-            foreach ($y in $rows) {
-              for ($x = ($w.Left + 20); $x -le ($w.Right - 20); $x += 18) {
-                try {
-                  $pt = New-Object System.Windows.Point ([double]$x), ([double]$y)
-                  $el = [System.Windows.Automation.AutomationElement]::FromPoint($pt)
-                  if (-not $el) { continue }
-                  if ($el.Current.ProcessId -ne $procId) { continue }
-                  $btn = Get-ButtonFromElement $el
-                  if (-not $btn) { continue }
-                  $nm = Clean-Name ([string]$btn.Current.Name)
-                  if ($nm -and -not $map.ContainsKey($nm)) { $map[$nm] = $btn }
-                }
-                catch {}
-              }
+          function Get-PcaGeometry($hwnd) {
+            $fr = [Ui32]::FrameRect($hwnd)
+            if ($null -eq $fr) { return $null }
+            $w = [int]($fr[2] - $fr[0])
+            $ht = [int]($fr[3] - $fr[1])
+            $sx = [Math]::Max(0.75, [Math]::Min(2.0, $w / 585.0))
+            return [pscustomobject]@{
+              Left = [int]$fr[0]
+              Top = [int]$fr[1]
+              Right = [int]$fr[2]
+              Bottom = [int]$fr[3]
+              Width = $w
+              Height = $ht
+              Scale = $sx
+              CancelX = [int]($fr[2] - 156 * $sx)
+              CancelY = [int]($fr[3] - 41 * $sx)
+              CloseX = [int]($fr[2] - 15 * $sx)
+              CloseY = [int]($fr[1] + 15 * $sx)
+              BodyX = [int]($fr[2] - 120 * $sx)
+              BodyY = [int]($fr[1] + 60 * $sx)
             }
+          }
 
-            # Also try UIA rooted at each child HWND (XAML content bridge).
-            foreach ($k in [Ui32]::Kids($hwnd)) {
+          function Wait-Gone($hwnd, [int]$ms) {
+            $steps = [int]($ms / 200)
+            for ($i = 0; $i -lt $steps; $i++) {
+              if (-not (Test-Alive $hwnd)) { return $true }
+              Start-Sleep -Milliseconds 200
+            }
+            return (-not (Test-Alive $hwnd))
+          }
+
+          # Click only if the window under the point belongs to the PCA process.
+          function Click-IfOwned([int]$x, [int]$y, [int]$procId, [string]$what) {
+            $hit = [Ui32]::HitPid($x, $y)
+            if ($hit -ne $procId) {
+              L ("   PCA click '{0}' skipped: ({1},{2}) is owned by pid {3}, expected {4}" -f $what, $x, $y, $hit, $procId)
+              return $false
+            }
+            L ("   PCA click '{0}' at ({1},{2})" -f $what, $x, $y)
+            [Ui32]::PressAt($x, $y, 250, 120)
+            return $true
+          }
+
+          # Try UIA first: Cancel from the top-level window, from each child window
+          # (XAML content bridge), and from the calibrated Cancel point.
+          function Invoke-PcaUia($win, [int]$procId, $geo) {
+            $seenNames = New-Object System.Collections.ArrayList
+            $targets = New-Object System.Collections.ArrayList
+            [void]$targets.Add($win.H)
+            foreach ($k in [Ui32]::Kids($win.H)) { [void]$targets.Add($k.Hwnd) }
+
+            foreach ($hw in $targets) {
               try {
-                $root = [System.Windows.Automation.AutomationElement]::FromHandle($k.Hwnd)
+                $root = [System.Windows.Automation.AutomationElement]::FromHandle($hw)
                 $cond = New-Object System.Windows.Automation.PropertyCondition(
                   [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
                   [System.Windows.Automation.ControlType]::Button)
-                foreach ($b in @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond))) {
-                  $nm = Clean-Name ([string]$b.Current.Name)
-                  if ($nm -and -not $map.ContainsKey($nm)) { $map[$nm] = $b }
+                $found = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+                foreach ($b in $found) {
+                  $nm = [string]$b.Current.Name
+                  [void]$seenNames.Add($nm)
+                  if ((Clean-Name $nm) -eq 'cancel') {
+                    $pat = $null
+                    if ($b.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
+                      $pat.Invoke()
+                      return 'uia-invoke-cancel'
+                    }
+                  }
                 }
               }
               catch {}
             }
 
-            return $map
+            if ($geo) {
+              try {
+                $pt = New-Object System.Windows.Point
+                $pt.X = [double]$geo.CancelX
+                $pt.Y = [double]$geo.CancelY
+                $el = [System.Windows.Automation.AutomationElement]::FromPoint($pt)
+                if ($el -and ($el.Current.ProcessId -eq $procId)) {
+                  $btn = Get-ButtonFromElement $el
+                  if ($btn) {
+                    $nm = [string]$btn.Current.Name
+                    [void]$seenNames.Add('(at point) ' + $nm)
+                    if ((Clean-Name $nm) -eq 'cancel') {
+                      $pat = $null
+                      if ($btn.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
+                        $pat.Invoke()
+                        return 'uia-invoke-cancel-at-point'
+                      }
+                    }
+                  }
+                }
+              }
+              catch {}
+            }
+
+            L ("   PCA uia buttons seen: [{0}]" -f ($seenNames -join ' | '))
+            return $null
+          }
+
+          function Complete-Pca($key, [string]$how) {
+            $script:pcaClosed[$key] = $true
+            L ("PCA: dismissed via {0}" -f $how)
+            Shot 'pca_dismissed'
           }
 
           function Close-PcaWindow($win) {
             $key = $win.H.ToString()
             if ($script:pcaClosed.ContainsKey($key)) { return $false }
+            if ($script:pcaGaveUp.ContainsKey($key)) { return $false }
+            if (-not $script:pcaSeenAt.ContainsKey($key)) { $script:pcaSeenAt[$key] = Get-Date }
+
+            # Give the XAML content time to render before touching it.
+            if (((Get-Date) - $script:pcaSeenAt[$key]).TotalSeconds -lt 1.5) { return $true }
+
+            $procId = [Ui32]::ProcId($win.H)
+            $pname = 'unknown'
+            try { $pname = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch {}
+
             if (-not $script:pcaTries.ContainsKey($key)) { $script:pcaTries[$key] = 0 }
             $script:pcaTries[$key] = [int]$script:pcaTries[$key] + 1
             $n = [int]$script:pcaTries[$key]
-            $procId = [Ui32]::ProcId($win.H)
+
+            if ($n -gt 3) {
+              $script:pcaGaveUp[$key] = $true
+              L 'PCA: could not dismiss after 3 rounds; leaving it open (it does not block the application)'
+              Shot 'pca_gave_up'
+              return $false
+            }
+
+            $geo = Get-PcaGeometry $win.H
+            $geoOk = $false
+            if ($geo) {
+              if ($geo.Width -ge 400 -and $geo.Width -le 900 -and $geo.Height -ge 150 -and $geo.Height -le 450) {
+                $geoOk = $true
+              }
+            }
 
             if ($n -eq 1) {
-              L ("== [PCA] compatibility warning hwnd={0} title='{1}' pid={2}" -f $key, $win.Title, $procId)
-              try {
-                $p = Get-Process -Id $procId -ErrorAction Stop
-                L ("   PCA process: {0}  path={1}" -f $p.ProcessName, $p.Path)
+              L ("== [PCA] compatibility warning hwnd={0} title='{1}' pid={2} process={3}" -f $key, $win.Title, $procId, $pname)
+              if ($geo) {
+                L ("   PCA frame: left={0} top={1} right={2} bottom={3} size={4}x{5} scale={6}" -f
+                  $geo.Left, $geo.Top, $geo.Right, $geo.Bottom, $geo.Width, $geo.Height, $geo.Scale)
+                L ("   PCA planned points: cancel=({0},{1}) close=({2},{3}) body=({4},{5})" -f
+                  $geo.CancelX, $geo.CancelY, $geo.CloseX, $geo.CloseY, $geo.BodyX, $geo.BodyY)
               }
-              catch { L '   PCA process: unavailable' }
+              else {
+                L '   PCA frame: unavailable'
+              }
               L ("   PCA child windows: {0}" -f (([Ui32]::Kids($win.H) | ForEach-Object {
                 '{0}[{1}]' -f $_.Cls, $_.Txt }) -join ' | '))
               L ("   PCA uia(root): {0}" -f (Dump-Uia $win.H 60))
               Shot 'pca_detected'
             }
 
-            if ($n -gt 3) {
-              if (-not $script:pcaGaveUp.ContainsKey($key)) {
-                $script:pcaGaveUp[$key] = $true
-                L 'PCA: could not dismiss after 3 rounds; excluding it from the wizard loop (does not block the app)'
-                Shot 'pca_gave_up'
-              }
-              return $false
+            L ("   PCA round {0}/3" -f $n)
+
+            # A. UIA Invoke on a real Cancel button, if any is exposed.
+            $how = $null
+            try { $how = Invoke-PcaUia $win $procId $geo }
+            catch { L ("   PCA uia strategy error: {0}" -f $_.Exception.Message) }
+            if ($how) {
+              if (Wait-Gone $win.H 1500) { Complete-Pca $key $how; return $true }
+              L ("   PCA: {0} reported success but the window is still visible" -f $how)
             }
 
-            $how = 'none'
+            if ($geoOk) {
+              # B. Real mouse click on Cancel. The x offset varies a little per round.
+              $dxList = @(0, -24, 24)
+              $cx = [int]($geo.CancelX + [int]$dxList[$n - 1])
+              ShotMark ('pca_target_round_{0}' -f $n) $cx $geo.CancelY $geo.CloseX $geo.CloseY
+              if (Click-IfOwned $cx $geo.CancelY $procId 'Cancel') {
+                if (Wait-Gone $win.H 2000) { Complete-Pca $key 'mouse-click-cancel'; return $true }
+                L '   PCA: Cancel click sent but the window is still visible'
+              }
 
-            # Strategy 1: locate the real Cancel button via hit-testing / child UIA.
-            $btns = Find-PcaButtons $win.H $procId
-            L ("   PCA buttons located: {0}" -f (($btns.Keys | Sort-Object) -join ' | '))
+              # C. Title-bar close button.
+              if (Click-IfOwned $geo.CloseX $geo.CloseY $procId 'Close (X)') {
+                if (Wait-Gone $win.H 2000) { Complete-Pca $key 'mouse-click-close-x'; return $true }
+                L '   PCA: Close (X) click sent but the window is still visible'
+              }
 
-            if ($btns.ContainsKey('cancel')) {
-              $b = $btns['cancel']
+              # D. Activate the dialog by clicking blank body area, then Alt+F4
+              #    only if the PCA is verifiably the foreground window.
+              if (Click-IfOwned $geo.BodyX $geo.BodyY $procId 'dialog body (activate only)') {
+                Start-Sleep -Milliseconds 400
+              }
+              $fgPid = [Ui32]::ProcId([Ui32]::GetForegroundWindow())
+              if ($fgPid -eq $procId) {
+                L '   PCA: dialog is foreground; sending Alt+F4'
+                [void]$wshell.SendKeys('%{F4}')
+                if (Wait-Gone $win.H 1500) { Complete-Pca $key 'alt-f4'; return $true }
+              }
+              else {
+                L ("   PCA: foreground pid is {0}, not the PCA; Alt+F4 not sent" -f $fgPid)
+              }
+            }
+            else {
+              L '   PCA: frame geometry unavailable or unexpected size; coordinate clicks skipped'
+            }
+
+            # E. Last resort: terminate the PCA UI host, only if it really is pcaui.
+            if ($pname -ieq 'pcaui') {
               try {
-                $pat = $null
-                if ($b.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
-                  $pat.Invoke()
-                  $how = 'uia-invoke-cancel'
-                }
+                Stop-Process -Id $procId -Force -ErrorAction Stop
+                L ("   PCA: terminated pcaui.exe (pid {0})" -f $procId)
               }
-              catch { L ("   PCA invoke error: {0}" -f $_.Exception.Message) }
-
-              if ($how -eq 'none') {
-                try {
-                  $rc = $b.Current.BoundingRectangle
-                  if ($rc.Width -gt 0 -and $rc.Height -gt 0) {
-                    [Ui32]::Focus($win.H)
-                    Start-Sleep -Milliseconds 200
-                    [Ui32]::ClickAt([int]($rc.X + $rc.Width / 2), [int]($rc.Y + $rc.Height / 2))
-                    $how = 'mouse-cancel'
-                  }
-                }
-                catch { L ("   PCA mouse error: {0}" -f $_.Exception.Message) }
+              catch {
+                L ("   PCA: could not terminate pcaui (pid {0}): {1}" -f $procId, $_.Exception.Message)
               }
-
-              if ($how -ne 'none') {
-                Start-Sleep -Milliseconds 1200
-                if (-not (Test-Alive $win.H)) {
-                  $script:pcaClosed[$key] = $true
-                  L ("PCA: dismissed via {0}" -f $how)
-                  Shot 'pca_dismissed'
-                  return $true
-                }
-              }
+              if (Wait-Gone $win.H 1500) { Complete-Pca $key 'kill-pcaui'; return $true }
+            }
+            else {
+              L ("   PCA: owning process is '{0}', not pcaui; refusing to terminate it" -f $pname)
             }
 
-            # Strategy 2: system close command (same path as the title-bar X).
-            [void][Ui32]::PostMessage($win.H, 0x0112, [IntPtr]0xF060, [IntPtr]::Zero)
-            Start-Sleep -Milliseconds 1200
-            if (-not (Test-Alive $win.H)) {
-              $script:pcaClosed[$key] = $true
-              L 'PCA: dismissed via SC_CLOSE'
-              Shot 'pca_dismissed'
-              return $true
-            }
-
-            # Strategy 3: Alt+F4 with the dialog focused.
-            [Ui32]::Focus($win.H)
-            Start-Sleep -Milliseconds 250
-            if ([Ui32]::GetForegroundWindow() -eq $win.H) {
-              [void]$wshell.SendKeys('%{F4}')
-              Start-Sleep -Milliseconds 1200
-              if (-not (Test-Alive $win.H)) {
-                $script:pcaClosed[$key] = $true
-                L 'PCA: dismissed via Alt+F4'
-                Shot 'pca_dismissed'
-                return $true
-              }
-            }
-
-            # Strategy 4: plain WM_CLOSE (kept from v4).
-            [void][Ui32]::SendMessage($win.H, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
-            Start-Sleep -Milliseconds 1200
-            if (-not (Test-Alive $win.H)) {
-              $script:pcaClosed[$key] = $true
-              L 'PCA: dismissed via WM_CLOSE'
-              Shot 'pca_dismissed'
-              return $true
-            }
-
-            L ("PCA: round {0} finished (last method {1}); still visible" -f $n, $how)
+            L ("PCA: round {0} finished; window still visible" -f $n)
             Shot ('pca_round_' + $n)
             return $true
           }
@@ -934,13 +1091,25 @@ jobs:
           function Close-AnyPca {
             $count = 0
             foreach ($t in [Ui32]::Tops()) {
-              if ($t.Visible -and $t.Txt -match '(?i)Program Compatibility') {
-                $w = [pscustomobject]@{ H = $t.Hwnd; Title = $t.Txt; Cls = $t.Cls; Proc = 'pca' }
-                [void](Close-PcaWindow $w)
-                if (-not (Test-Alive $t.Hwnd)) { $count++ }
-              }
+              if (-not ($t.Visible -and $t.Txt -match '(?i)Program Compatibility')) { continue }
+              $w = [pscustomobject]@{ H = $t.Hwnd; Title = $t.Txt; Cls = $t.Cls; Proc = 'pca' }
+              try { [void](Close-PcaWindow $w) }
+              catch { L ("PCA handler error (continuing): {0}" -f $_.Exception.Message) }
+              if (-not (Test-Alive $t.Hwnd)) { $count++ }
             }
             return $count
+          }
+
+          function Clear-Pca([string]$label) {
+            for ($k = 0; $k -lt 3; $k++) {
+              $open = @([Ui32]::Tops() | Where-Object { $_.Visible -and $_.Txt -match '(?i)Program Compatibility' })
+              if ($open.Count -eq 0) { break }
+              try { [void](Close-AnyPca) }
+              catch { L ("PCA pass error (continuing): {0}" -f $_.Exception.Message) }
+              Start-Sleep -Seconds 2
+            }
+            $left = @([Ui32]::Tops() | Where-Object { $_.Visible -and $_.Txt -match '(?i)Program Compatibility' }).Count
+            L ("{0}: PCA windows still visible = {1}" -f $label, $left)
           }
 
           # Completion page: uncheck optional launch/readme/update items, then click Finish.
@@ -1015,10 +1184,6 @@ jobs:
 
           function Invoke-Page($win) {
             $winH = $win.H
-
-            if ($win.Title -match '(?i)Program Compatibility') {
-              return (Close-PcaWindow $win)
-            }
 
             [Ui32]::Focus($winH)
             Start-Sleep -Milliseconds 200
@@ -1187,7 +1352,8 @@ jobs:
                 continue
               }
 
-              L ("   clicking '{0}' via BM_CLICK on '{1}'" -f $b.Txt, $win.Title)
+              L ("   clicking '{0}' via BM_CLICK on '{1}'" -f
+                $b.Txt, $win.Title)
               Shot ('click_' + $b.Txt)
               [Ui32]::Focus($winH)
               [Ui32]::Click($b.Hwnd)
@@ -1342,6 +1508,13 @@ jobs:
             for ($i = 1; $i -le 40; $i++) {
               Start-Sleep -Seconds 3
 
+              # The compatibility warning is handled in every round, not only after activation.
+              try {
+                $pcaDone = Close-AnyPca
+                if ($pcaDone -gt 0) { L ("app phase: closed {0} PCA window(s)" -f $pcaDone) }
+              }
+              catch { L ("PCA pass error (continuing): {0}" -f $_.Exception.Message) }
+
               $procs = @(Get-Process -ErrorAction SilentlyContinue |
                 Where-Object { $_.ProcessName -match '(?i)scenarist|hasp|sentinel' } |
                 ForEach-Object { '{0}({1})' -f $_.ProcessName, $_.Id })
@@ -1386,19 +1559,13 @@ jobs:
                   Shot ('app_window_' + $t.Txt)
                 }
 
-                # New: close the activation dialog once, then keep observing.
+                # Close the activation dialog once, then keep observing.
                 if ($pn -match '(?i)^scenaristbd$' -and
                     $t.Txt -match '(?i)^Scenarist Activation$' -and
                     -not $script:activationHandled) {
                   Close-ActivationWindow $t $kids
                   $newWins++
                 }
-              }
-
-              # After the activation dialog is handled, deal with the PCA warning.
-              if ($script:activationHandled) {
-                $pcaClosedNow = Close-AnyPca
-                if ($pcaClosedNow -gt 0) { L ("app phase: closed {0} PCA window(s)" -f $pcaClosedNow) }
               }
 
               Shot ('app_obs_{0:D2}' -f $i)
@@ -1517,13 +1684,18 @@ jobs:
             $wizardDone = $false
 
             while ((Get-Date) -lt $deadline) {
+              # Handle the compatibility warning first so wizard pages can never starve it.
+              try { [void](Close-AnyPca) }
+              catch { L ('PCA pass error (continuing): ' + $_.Exception.Message) }
+
               $wins = @(Get-WizardWindows)
 
               if ($wins.Count -eq 0) {
                 $busy = @(Get-Process -ErrorAction SilentlyContinue |
                   Where-Object {
                     $_.ProcessName -match '^(setup|setup64|ISBEW64|IDriver|IDriver2)$' -or
-                    ($_.ProcessName -eq 'msiexec' -and $_.MainWindowHandle -ne 0)
+                    ($_.ProcessName -eq 'msiexec' -and
+                     $_.MainWindowHandle -ne 0)
                   })
 
                 if ($setup.HasExited -and $busy.Count -eq 0) {
@@ -1595,6 +1767,9 @@ jobs:
             }
             if ($script:finishConfirmed) { L 'wizard: Finish confirmed' }
 
+            # Make sure the compatibility warning is gone before the application starts.
+            Clear-Pca 'after wizard'
+
             Get-ItemProperty `
               'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' `
@@ -1633,17 +1808,10 @@ jobs:
               }
             }
 
-            # Final attempt on any compatibility warning still open (PCA tries are per-window; reset for the final pass).
+            # Final pass: PCA counters are per-window, so reset them for one more full attempt.
             $script:pcaTries = @{}
             $script:pcaGaveUp = @{}
-            for ($k = 0; $k -lt 2; $k++) {
-              $remaining = @([Ui32]::Tops() | Where-Object { $_.Visible -and $_.Txt -match '(?i)Program Compatibility' })
-              if ($remaining.Count -eq 0) { break }
-              [void](Close-AnyPca)
-              Start-Sleep -Seconds 2
-            }
-            $stillPca = @([Ui32]::Tops() | Where-Object { $_.Visible -and $_.Txt -match '(?i)Program Compatibility' }).Count
-            L ("final: PCA windows still visible = {0}" -f $stillPca)
+            Clear-Pca 'final'
             Shot 'final_desktop'
           }
           catch {
