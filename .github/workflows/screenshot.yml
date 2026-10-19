@@ -185,7 +185,6 @@ jobs:
             public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
             public const uint BM_CLICK = 0x00F5;
             public const uint BM_GETCHECK = 0x00F0;
-            public const uint WM_CLOSE = 0x0010;
             public const int GWL_STYLE = -16;
 
             [StructLayout(LayoutKind.Sequential)]
@@ -260,6 +259,7 @@ jobs:
               return b.ToString();
             }
 
+            // Renamed from "New": PowerShell treats [Type]::New(...) as a constructor call.
             public static UiCtl Describe(IntPtr h) {
               var c = new UiCtl();
               c.Hwnd = h;
@@ -348,6 +348,8 @@ jobs:
               mouse_event(4, 0, 0, 0, UIntPtr.Zero);
             }
 
+            // Hover first, then press and release with a short hold.
+            // XAML buttons need a pointer-over state before they accept a click.
             public static void PressAt(int x, int y, int hoverMs, int holdMs) {
               SetCursorPos(x - 3, y - 2);
               System.Threading.Thread.Sleep(60);
@@ -358,6 +360,7 @@ jobs:
               mouse_event(4, 0, 0, 0, UIntPtr.Zero);
             }
 
+            // Process id that owns the window currently under the screen point.
             public static int HitPid(int x, int y) {
               POINT p = new POINT();
               p.X = x;
@@ -369,6 +372,7 @@ jobs:
               return (int)pid;
             }
 
+            // Visible frame bounds (DWMWA_EXTENDED_FRAME_BOUNDS = 9); falls back to GetWindowRect.
             public static int[] FrameRect(IntPtr h) {
               RECT r = new RECT();
               bool ok = false;
@@ -471,6 +475,8 @@ jobs:
             }
           }
 
+          # Same as Shot, but draws red crosshairs at two screen points so the click
+          # targets can be checked and re-calibrated from the saved image.
           function ShotMark([string]$tag, [int]$x1, [int]$y1, [int]$x2, [int]$y2) {
             try {
               $r = [System.Windows.Forms.SystemInformation]::VirtualScreen
@@ -501,6 +507,7 @@ jobs:
             }
           }
 
+          # Keep the existing 1.5-second screenshot timeline.
           $job = Start-Job -ArgumentList $shots -ScriptBlock {
             param($d)
             Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -549,11 +556,12 @@ jobs:
           $script:pcaGaveUp = @{}
           $script:pcaClosed = @{}
           $script:pcaSeenAt = @{}
+          $script:pagingTries = @{}
+          $script:pagingGaveUp = @{}
           $script:finishTries = @{}
           $script:finishConfirmed = $false
           $script:appExitLogged = $false
           $script:activationHandled = $false
-          $script:sysPropClosed = @{}
           $script:stopReason = $null
 
           function Test-Radio($ctl) {
@@ -603,8 +611,8 @@ jobs:
               if (-not $t.Visible) { continue }
               if ([string]::IsNullOrWhiteSpace($t.Txt)) { continue }
               if ($t.Txt -match 'ProgramData\\GitHub|hosted-compute|Runner\.Listener') { continue }
+              # The compatibility warning is handled separately (see Close-AnyPca).
               if ($t.Txt -match '(?i)Program Compatibility') { continue }
-              if ($t.Txt -match '(?i)^System Properties$') { continue }
 
               $procName = 'unknown'
               try {
@@ -636,63 +644,6 @@ jobs:
             } })
           }
 
-          # ---------------------------------------------------------------
-          # Handle the rare "System Properties" paging file warning dialog
-          # ---------------------------------------------------------------
-          function Close-SystemPropertiesDialog {
-            $handledCount = 0
-            foreach ($t in [Ui32]::Tops()) {
-              if (-not ($t.Visible -and ($t.Txt -match '(?i)^System Properties$'))) { continue }
-              $key = $t.Hwnd.ToString()
-              if ($script:sysPropClosed.ContainsKey($key)) { continue }
-
-              L ("== [System Properties] Paging file dialog detected (hwnd={0})" -f $key)
-              Shot 'sysprop_detected'
-
-              $kids = @([Ui32]::Kids($t.Hwnd))
-              $okBtn = $kids | Where-Object {
-                $_.Visible -and $_.Enabled -and $_.Cls -match '(?i)button' -and
-                ((Clean-Name $_.Txt) -match '^(ok|确定)$')
-              } | Select-Object -First 1
-
-              $dismissed = $false
-              if ($okBtn) {
-                L ("   System Properties: clicking OK button (hwnd={0})" -f $okBtn.Hwnd)
-                [Ui32]::Focus($t.Hwnd)
-                Start-Sleep -Milliseconds 150
-                [Ui32]::Click($okBtn.Hwnd)
-                Start-Sleep -Milliseconds 600
-                if (-not (Test-Alive $t.Hwnd)) { $dismissed = $true }
-              }
-
-              if (-not $dismissed) {
-                L "   System Properties: sending Enter / Space fallback"
-                [Ui32]::Focus($t.Hwnd)
-                Start-Sleep -Milliseconds 150
-                [void]$wshell.SendKeys('{ENTER}')
-                Start-Sleep -Milliseconds 600
-                if (-not (Test-Alive $t.Hwnd)) { $dismissed = $true }
-              }
-
-              if (-not $dismissed) {
-                L "   System Properties: sending WM_CLOSE"
-                [void][Ui32]::SendMessage($t.Hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
-                Start-Sleep -Milliseconds 600
-                if (-not (Test-Alive $t.Hwnd)) { $dismissed = $true }
-              }
-
-              if ($dismissed) {
-                $script:sysPropClosed[$key] = $true
-                L "   System Properties: dialog dismissed successfully"
-                Shot 'sysprop_dismissed'
-                $handledCount++
-              } else {
-                L "   System Properties: dialog still visible after attempts"
-              }
-            }
-            return $handledCount
-          }
-
           function Find-CustomerField($kids, [string]$labelRegex) {
             $labels = @($kids | Where-Object {
               $_.Visible -and
@@ -707,6 +658,8 @@ jobs:
 
             $label = $labels[0]
 
+            # Match the visible input immediately below the label. The
+            # Serial Number label seen in the control log is not used.
             $candidates = @($kids | Where-Object {
               $_.Visible -and $_.Enabled -and
               ($_.Right - $_.Left) -ge 120 -and
@@ -828,6 +781,7 @@ jobs:
               Set-CustomerField $win.H $companyField 'Home' 'Company' ($attempt -gt 1)
               Shot 'customer_fields_verified'
 
+              # Re-enumerate: the earlier Next object was disabled and stale.
               $next = $null
               for ($i = 0; $i -lt 15; $i++) {
                 $next = [Ui32]::Kids($win.H) | Where-Object {
@@ -885,9 +839,22 @@ jobs:
               }
             }
 
+            # Suppress the generic Enter/Alt+N fallback on this page.
             return $true
           }
 
+          # ---------------------------------------------------------------
+          # Program Compatibility Assistant (PCA) handling.
+          # The warning is a XAML island hosted by pcaui.exe: there are no Win32
+          # button children (BM_CLICK is useless) and UIA exposes only a
+          # DesktopWindowXamlSource pane. The reliable route is a real mouse click
+          # at window-relative coordinates, guarded by a hit-test so that only a
+          # window owned by the PCA process can ever receive the click.
+          # "Learn more" is never clicked.
+          # Offsets were calibrated on two 1920x1080 screenshots (PCA window at two
+          # different screen positions): Cancel center = (right-156, bottom-41),
+          # close X = (right-15, top+15), blank body area = (right-120, top+60).
+          # ---------------------------------------------------------------
           function Get-ButtonFromElement($el) {
             $cur = $el
             for ($d = 0; $d -lt 5 -and $cur; $d++) {
@@ -932,17 +899,20 @@ jobs:
             return (-not (Test-Alive $hwnd))
           }
 
+          # Click only if the window under the point belongs to the expected process.
           function Click-IfOwned([int]$x, [int]$y, [int]$procId, [string]$what) {
             $hit = [Ui32]::HitPid($x, $y)
             if ($hit -ne $procId) {
-              L ("   PCA click '{0}' skipped: ({1},{2}) is owned by pid {3}, expected {4}" -f $what, $x, $y, $hit, $procId)
+              L ("   click '{0}' skipped: ({1},{2}) is owned by pid {3}, expected {4}" -f $what, $x, $y, $hit, $procId)
               return $false
             }
-            L ("   PCA click '{0}' at ({1},{2})" -f $what, $x, $y)
+            L ("   click '{0}' at ({1},{2})" -f $what, $x, $y)
             [Ui32]::PressAt($x, $y, 250, 120)
             return $true
           }
 
+          # Try UIA first: Cancel from the top-level window, from each child window
+          # (XAML content bridge), and from the calibrated Cancel point.
           function Invoke-PcaUia($win, [int]$procId, $geo) {
             $seenNames = New-Object System.Collections.ArrayList
             $targets = New-Object System.Collections.ArrayList
@@ -1011,6 +981,7 @@ jobs:
             if ($script:pcaGaveUp.ContainsKey($key)) { return $false }
             if (-not $script:pcaSeenAt.ContainsKey($key)) { $script:pcaSeenAt[$key] = Get-Date }
 
+            # Give the XAML content time to render before touching it.
             if (((Get-Date) - $script:pcaSeenAt[$key]).TotalSeconds -lt 1.5) { return $true }
 
             $procId = [Ui32]::ProcId($win.H)
@@ -1055,6 +1026,7 @@ jobs:
 
             L ("   PCA round {0}/3" -f $n)
 
+            # A. UIA Invoke on a real Cancel button, if any is exposed.
             $how = $null
             try { $how = Invoke-PcaUia $win $procId $geo }
             catch { L ("   PCA uia strategy error: {0}" -f $_.Exception.Message) }
@@ -1064,6 +1036,7 @@ jobs:
             }
 
             if ($geoOk) {
+              # B. Real mouse click on Cancel. The x offset varies a little per round.
               $dxList = @(0, -24, 24)
               $cx = [int]($geo.CancelX + [int]$dxList[$n - 1])
               ShotMark ('pca_target_round_{0}' -f $n) $cx $geo.CancelY $geo.CloseX $geo.CloseY
@@ -1072,11 +1045,14 @@ jobs:
                 L '   PCA: Cancel click sent but the window is still visible'
               }
 
+              # C. Title-bar close button.
               if (Click-IfOwned $geo.CloseX $geo.CloseY $procId 'Close (X)') {
                 if (Wait-Gone $win.H 2000) { Complete-Pca $key 'mouse-click-close-x'; return $true }
                 L '   PCA: Close (X) click sent but the window is still visible'
               }
 
+              # D. Activate the dialog by clicking blank body area, then Alt+F4
+              #    only if the PCA is verifiably the foreground window.
               if (Click-IfOwned $geo.BodyX $geo.BodyY $procId 'dialog body (activate only)') {
                 Start-Sleep -Milliseconds 400
               }
@@ -1094,6 +1070,7 @@ jobs:
               L '   PCA: frame geometry unavailable or unexpected size; coordinate clicks skipped'
             }
 
+            # E. Last resort: terminate the PCA UI host, only if it really is pcaui.
             if ($pname -ieq 'pcaui') {
               try {
                 Stop-Process -Id $procId -Force -ErrorAction Stop
@@ -1137,10 +1114,158 @@ jobs:
             L ("{0}: PCA windows still visible = {1}" -f $label, $left)
           }
 
+          # ---------------------------------------------------------------
+          # "System Properties" paging-file notice (appears only sometimes).
+          # It is expected to be an ordinary Win32 message box (class #32770) with
+          # a Static message and one OK Button, so BM_CLICK should work. It is not
+          # matched by the installer window filter, so it needs its own handler.
+          # Identity: title "System Properties" + message about a temporary paging
+          # file + no tab control (the real System Properties applet has tabs).
+          # No process is ever terminated here.
+          # ---------------------------------------------------------------
+          function Close-PagingNotice {
+            $count = 0
+
+            foreach ($t in [Ui32]::Tops()) {
+              if (-not $t.Visible) { continue }
+              if ($t.Txt -ine 'System Properties') { continue }
+
+              $key = $t.Hwnd.ToString()
+              if ($script:pagingGaveUp.ContainsKey($key)) { continue }
+
+              $kids = @([Ui32]::Kids($t.Hwnd))
+              $bodyText = (($kids | Where-Object { $_.Txt } |
+                ForEach-Object { $_.Txt }) -join ' ')
+
+              # Text must be readable and must be the paging-file message.
+              if ($bodyText -notmatch '(?i)temporary paging file|paging file configuration') {
+                continue
+              }
+
+              # Never touch the real System Properties applet (it has tabs).
+              if (@($kids | Where-Object { $_.Cls -match '(?i)SysTabControl32' }).Count -gt 0) {
+                continue
+              }
+
+              if (-not $script:pagingTries.ContainsKey($key)) { $script:pagingTries[$key] = 0 }
+              $script:pagingTries[$key] = [int]$script:pagingTries[$key] + 1
+              $n = [int]$script:pagingTries[$key]
+
+              $procId = [Ui32]::ProcId($t.Hwnd)
+              $pname = 'unknown'
+              try { $pname = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch {}
+
+              if ($n -gt 3) {
+                $script:pagingGaveUp[$key] = $true
+                L 'PAGING: could not dismiss after 3 rounds; leaving it open'
+                Shot 'paging_gave_up'
+                continue
+              }
+
+              $buttons = @($kids | Where-Object { $_.Cls -match '(?i)^button$' })
+              $okBtn = $buttons | Where-Object {
+                $_.Visible -and $_.Enabled -and (Clean-Name $_.Txt) -eq 'ok'
+              } | Select-Object -First 1
+
+              if ($n -eq 1) {
+                L ("== [PAGING] System Properties notice hwnd={0} class='{1}' pid={2} process={3}" -f
+                  $key, $t.Cls, $procId, $pname)
+                L ("   PAGING text: {0}" -f $bodyText)
+                L ("   PAGING controls: {0}" -f (($kids | ForEach-Object {
+                  '{0}[{1}] en={2} vis={3}' -f $_.Cls, $_.Txt, $_.Enabled, $_.Visible
+                }) -join ' | '))
+                Shot 'paging_detected'
+              }
+
+              L ("   PAGING round {0}/3 (OK button found: {1})" -f $n, [bool]$okBtn)
+
+              $closed = $false
+              $how = ''
+
+              # A. Native BM_CLICK on the OK button (posted, so a busy owner cannot block us).
+              if ($okBtn) {
+                [Ui32]::Focus($t.Hwnd)
+                Start-Sleep -Milliseconds 250
+                [void][Ui32]::PostMessage($okBtn.Hwnd, [Ui32]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+                if (Wait-Gone $t.Hwnd 2000) { $closed = $true; $how = 'bm-click-ok' }
+              }
+
+              # B. Real mouse click at the center of the OK button.
+              if (-not $closed -and $okBtn) {
+                $ox = [int](($okBtn.Left + $okBtn.Right) / 2)
+                $oy = [int](($okBtn.Top + $okBtn.Bottom) / 2)
+                [Ui32]::Focus($t.Hwnd)
+                Start-Sleep -Milliseconds 250
+                if (Click-IfOwned $ox $oy $procId 'System Properties OK') {
+                  if (Wait-Gone $t.Hwnd 2000) { $closed = $true; $how = 'mouse-click-ok' }
+                }
+              }
+
+              # C. Enter, only when this notice is verifiably the foreground window
+              #    (OK is the default button of a message box).
+              if (-not $closed) {
+                [Ui32]::Focus($t.Hwnd)
+                Start-Sleep -Milliseconds 300
+                $fgWin = [Ui32]::GetForegroundWindow()
+                if ($fgWin -eq $t.Hwnd -or [Ui32]::ProcId($fgWin) -eq $procId) {
+                  L '   PAGING: notice is foreground; sending Enter'
+                  [void]$wshell.SendKeys('{ENTER}')
+                  if (Wait-Gone $t.Hwnd 1500) { $closed = $true; $how = 'enter-key' }
+                }
+                else {
+                  L '   PAGING: notice is not foreground; Enter not sent'
+                }
+              }
+
+              # D. No Win32 OK button was readable: use window-relative geometry
+              #    (estimated from a 1920x1080 screenshot: OK center is about
+              #    53 px left of the right edge and 22 px above the bottom edge).
+              if (-not $closed -and -not $okBtn) {
+                $fr = [Ui32]::FrameRect($t.Hwnd)
+                if ($fr) {
+                  $fw = [int]($fr[2] - $fr[0])
+                  $fh = [int]($fr[3] - $fr[1])
+                  if ($fw -ge 300 -and $fw -le 700 -and $fh -ge 120 -and $fh -le 320) {
+                    $sx = [Math]::Max(0.75, [Math]::Min(2.0, $fw / 404.0))
+                    $gx = [int]($fr[2] - 53 * $sx)
+                    $gy = [int]($fr[3] - 22 * $sx)
+                    ShotMark ('paging_target_round_{0}' -f $n) $gx $gy $gx $gy
+                    if (Click-IfOwned $gx $gy $procId 'System Properties OK (geometry)') {
+                      if (Wait-Gone $t.Hwnd 2000) { $closed = $true; $how = 'geometry-click-ok' }
+                    }
+                  }
+                  else {
+                    L ("   PAGING: unexpected window size {0}x{1}; geometry click skipped" -f $fw, $fh)
+                  }
+                }
+              }
+
+              # E. WM_CLOSE: a single-button message box treats close as OK.
+              if (-not $closed) {
+                [void][Ui32]::PostMessage($t.Hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+                if (Wait-Gone $t.Hwnd 1500) { $closed = $true; $how = 'wm-close' }
+              }
+
+              if ($closed) {
+                L ("PAGING: dismissed via {0}" -f $how)
+                Shot 'paging_dismissed'
+                $count++
+              }
+              else {
+                L ("PAGING: round {0} finished; notice still visible" -f $n)
+                Shot ('paging_round_' + $n)
+              }
+            }
+
+            return $count
+          }
+
+          # Completion page: uncheck optional launch/readme/update items, then click Finish.
           function Handle-Completion($win, $kids, $buttons, $pageText) {
             $key = $win.H.ToString()
             if (-not $script:finishTries.ContainsKey($key)) { $script:finishTries[$key] = 0 }
 
+            # If a restart choice exists, pick the defer option only (never restart now).
             if ($pageText -match '(?i)restart|reboot') {
               $defer = $kids | Where-Object {
                 $_.Visible -and $_.Enabled -and $_.Cls -match '(?i)button' -and
@@ -1155,6 +1280,7 @@ jobs:
               }
             }
 
+            # Uncheck optional items so we control the launch ourselves.
             $optRx = '(?i)Show the Windows Installer log|check for program updates|Show the readme file|Launch the program'
             $unchecked = $false
             foreach ($c in $kids) {
@@ -1241,11 +1367,14 @@ jobs:
               $_.Visible -and $_.Enabled -and ((Clean-Name $_.Txt) -match '^(next|install|finish|yes|ok)$')
             }).Count -gt 0
 
+            # Completion page is checked BEFORE the progress check, because its text
+            # ("Setup has finished installing ...") contains the word "installing".
             $isCompletePage = $pageText -match '(?i)Installer Completed|successfully installed|has finished installing|Click Finish to exit|Setup has finished'
             if ($isCompletePage) {
               if (Handle-Completion $win $kids $buttons $pageText) { return $true }
             }
 
+            # Real progress pages: only wait when no advance button is enabled.
             $isProgress = $pageText -match '(?i)please wait|copying (new )?files|installing drivers|gathering permissions|updating component|publishing assembly|uninstalling|validating|removing|installing scenarist|the program features you selected are being'
             if ($isProgress -and -not $hasAdvance) { return $true }
 
@@ -1342,6 +1471,7 @@ jobs:
               }
             }
 
+            # Never invent values for other disabled pages or serial fields.
             $nextBtn = $buttons | Where-Object {
               $_.Txt -match '(?i)^&?Next'
             } | Select-Object -First 1
@@ -1370,7 +1500,8 @@ jobs:
                 continue
               }
 
-              L ("   clicking '{0}' via BM_CLICK on '{1}'" -f $b.Txt, $win.Title)
+              L ("   clicking '{0}' via BM_CLICK on '{1}'" -f
+                $b.Txt, $win.Title)
               Shot ('click_' + $b.Txt)
               [Ui32]::Focus($winH)
               [Ui32]::Click($b.Hwnd)
@@ -1383,6 +1514,7 @@ jobs:
             return $false
           }
 
+          # Locate the installed main executable: shortcuts first, then uninstall entries, then a Program Files scan.
           function Find-AppTarget {
             $found = New-Object System.Collections.ArrayList
             $wsh = New-Object -ComObject WScript.Shell
@@ -1459,6 +1591,10 @@ jobs:
             } })
           }
 
+          # ---------------------------------------------------------------
+          # Activation window: log it, click only "Close", then observe what the
+          # application does next. "Create" and "Activate" are never clicked.
+          # ---------------------------------------------------------------
           function Close-ActivationWindow($top, $kids) {
             if ($script:activationHandled) { return }
             $script:activationHandled = $true
@@ -1511,6 +1647,7 @@ jobs:
             Shot 'after_activation_close_state'
           }
 
+          # Observe the launched application for about two minutes. Record and screenshot new windows.
           function Observe-App($app) {
             $seenWin = @{}
             $seenProc = ''
@@ -1519,13 +1656,16 @@ jobs:
             for ($i = 1; $i -le 40; $i++) {
               Start-Sleep -Seconds 3
 
-              try { [void](Close-SystemPropertiesDialog) } catch {}
-
+              # The compatibility warning is handled in every round, not only after activation.
               try {
                 $pcaDone = Close-AnyPca
                 if ($pcaDone -gt 0) { L ("app phase: closed {0} PCA window(s)" -f $pcaDone) }
               }
               catch { L ("PCA pass error (continuing): {0}" -f $_.Exception.Message) }
+
+              # The paging-file notice can appear at any moment; keep watching for it.
+              try { [void](Close-PagingNotice) }
+              catch { L ("PAGING pass error (continuing): {0}" -f $_.Exception.Message) }
 
               $procs = @(Get-Process -ErrorAction SilentlyContinue |
                 Where-Object { $_.ProcessName -match '(?i)scenarist|hasp|sentinel' } |
@@ -1545,7 +1685,6 @@ jobs:
               foreach ($t in [Ui32]::Tops()) {
                 if (-not $t.Visible -or [string]::IsNullOrWhiteSpace($t.Txt)) { continue }
                 if ($t.Txt -match 'Program Compatibility') { continue }
-                if ($t.Txt -match '(?i)^System Properties$') { continue }
                 if ($t.Txt -match 'ProgramData\\GitHub|hosted-compute|Runner\.Listener') { continue }
 
                 $pn = 'unknown'
@@ -1572,6 +1711,7 @@ jobs:
                   Shot ('app_window_' + $t.Txt)
                 }
 
+                # Close the activation dialog once, then keep observing.
                 if ($pn -match '(?i)^scenaristbd$' -and
                     $t.Txt -match '(?i)^Scenarist Activation$' -and
                     -not $script:activationHandled) {
@@ -1590,6 +1730,7 @@ jobs:
             }
           }
 
+          # Read-only evidence about why the driver was blocked. Nothing is changed.
           function Save-Evidence {
             $f = "$env:OUT\logs\environment-evidence.txt"
             $lines = New-Object System.Collections.ArrayList
@@ -1684,6 +1825,11 @@ jobs:
 
           try {
             Shot 'desktop_before_setup'
+
+            # The paging-file notice may already be on screen before setup starts.
+            try { [void](Close-PagingNotice) }
+            catch { L ('PAGING pre-check error (continuing): ' + $_.Exception.Message) }
+
             $setup = Start-Process -FilePath $env:SETUP_EXE `
               -WorkingDirectory $env:PKG_DIR -PassThru
             L ("setup.exe started pid={0}  timeout={1} minutes" -f
@@ -1695,12 +1841,13 @@ jobs:
             $wizardDone = $false
 
             while ((Get-Date) -lt $deadline) {
-              # Check and dismiss rare system paging file dialog first
-              try { [void](Close-SystemPropertiesDialog) } catch {}
-
               # Handle the compatibility warning first so wizard pages can never starve it.
               try { [void](Close-AnyPca) }
               catch { L ('PCA pass error (continuing): ' + $_.Exception.Message) }
+
+              # The paging-file notice appears only sometimes; be ready on every round.
+              try { [void](Close-PagingNotice) }
+              catch { L ('PAGING pass error (continuing): ' + $_.Exception.Message) }
 
               $wins = @(Get-WizardWindows)
 
@@ -1781,7 +1928,10 @@ jobs:
             }
             if ($script:finishConfirmed) { L 'wizard: Finish confirmed' }
 
+            # Make sure the compatibility warning is gone before the application starts.
             Clear-Pca 'after wizard'
+            try { [void](Close-PagingNotice) }
+            catch { L ('PAGING after-wizard error (continuing): ' + $_.Exception.Message) }
 
             Get-ItemProperty `
               'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -1821,9 +1971,12 @@ jobs:
               }
             }
 
+            # Final pass: PCA counters are per-window, so reset them for one more full attempt.
             $script:pcaTries = @{}
             $script:pcaGaveUp = @{}
             Clear-Pca 'final'
+            try { [void](Close-PagingNotice) }
+            catch { L ('PAGING final error (continuing): ' + $_.Exception.Message) }
             Shot 'final_desktop'
           }
           catch {
