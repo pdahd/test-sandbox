@@ -1,8 +1,3 @@
-# screenshot.yml v1.1.0 (2026-10-24)
-# v1.1.0: step 4 - after the install wizard finishes, apply the CRACK folder
-#         overlay onto the installed tree BEFORE launching Scenarist BD.
-# v1.0.0: original tested version (download, install, auto-interact, screenshots).
-
 name: Scenarist BD - install & screenshot
 
 on:
@@ -13,7 +8,7 @@ on:
         default: "35"
 
 env:
-  PKG_URL: "https://1008.filemail.com/api/file/get?filekey=qZ8PSCAMNDT_UbcUmAm998Sbdsf_rsbG0d_8ihincKT-36w0PEM-2ToKW8eACEmyrA"
+  PKG_URL: "https://1008.filemail.com/api/file/get?filekey=2Y5DQeJfpB4iO_2BdjGWFMQoQtWe97xesJ2R2BdKbSCtn_POp2s1H1ayvTDfARHzJw"
   OUT: ${{ github.workspace }}\out
 
 jobs:
@@ -1948,107 +1943,6 @@ jobs:
               Format-Table -AutoSize |
               Out-String -Width 300 |
               Out-File "$env:OUT\logs\installed-programs.txt"
-
-            # ---------------------------------------------------------------
-            # PATCH PHASE (v1.1.0): overlay the CRACK folder onto the installed
-            # tree BEFORE the first launch. The wizard is finished, the app is
-            # not running yet, so the installed DLLs are replaceable in place.
-            # ---------------------------------------------------------------
-            try {
-              Shot 'before_patch'
-              $crackDir = Get-ChildItem -LiteralPath "$env:RUNNER_TEMP\pkg" -Recurse -Directory -Filter CRACK -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-              if (-not $crackDir) {
-                L 'patch: CRACK folder not found in the extracted package; skipping patch, will launch as installed'
-                Shot 'crack_not_found'
-              }
-              else {
-                L ("patch: CRACK folder => {0}" -f $crackDir.FullName)
-
-                # Safety: make sure nothing from the setup is still running and
-                # holding locks on the target DLLs.
-                Get-Process -ErrorAction SilentlyContinue |
-                  Where-Object { $_.Name -match '(?i)scenarist' } |
-                  ForEach-Object {
-                    L ("patch: stopping already-running process {0} (pid {1})" -f $_.Name, $_.Id)
-                    try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch {}
-                    Start-Sleep -Milliseconds 500
-                  }
-
-                # Install root: walk up from the main executable to the product
-                # folder "Scenarist BD"; its parent is the family install root
-                # that also holds "Scenarist BD-J" and "Scenarist Safeguard".
-                $installRoot = $null
-                $probe = @(Find-AppTarget)
-                if ($probe.Count -gt 0) {
-                  $dir = Split-Path -Parent ([string]$probe[0].Path)
-                  while ($dir -and $dir.Length -gt 3) {
-                    if ((Split-Path -Leaf $dir) -match '(?i)^Scenarist\s*BD$') { $installRoot = Split-Path -Parent $dir; break }
-                    $dir = Split-Path -Parent $dir
-                  }
-                }
-                if ($installRoot) {
-                  L ("patch: install root derived from main exe => {0}" -f $installRoot)
-                }
-                else {
-                  $regRoots = @(
-                    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-                  )
-                  $reg = Get-ItemProperty $regRoots -ErrorAction SilentlyContinue |
-                    Where-Object { $_.DisplayName -match '(?i)scenarist' -and $_.InstallLocation } |
-                    Select-Object -First 1
-                  if ($reg) {
-                    $loc = ([string]$reg.InstallLocation).TrimEnd('\')
-                    if ((Split-Path -Leaf $loc) -match '(?i)^Scenarist\s*BD$') { $installRoot = Split-Path -Parent $loc }
-                    else { $installRoot = $loc }
-                    L ("patch: install root from registry => {0}" -f $installRoot)
-                  }
-                }
-
-                $patched = 0; $skipped = 0
-                foreach ($prod in @(Get-ChildItem -LiteralPath $crackDir.FullName -Directory -ErrorAction SilentlyContinue)) {
-                  $dest = $null
-                  if ($installRoot -and (Test-Path -LiteralPath (Join-Path $installRoot $prod.Name))) {
-                    $dest = Join-Path $installRoot $prod.Name
-                  }
-                  else {
-                    $hit = Get-ChildItem -Path 'C:\Program Files','C:\Program Files (x86)' -Directory -Recurse -Depth 3 -Filter $prod.Name -ErrorAction SilentlyContinue |
-                      Select-Object -First 1
-                    if ($hit) { $dest = $hit.FullName }
-                  }
-                  if (-not $dest) {
-                    L ("patch: installed folder for '{0}' not found; skipped (product not installed?)" -f $prod.Name)
-                    $skipped++
-                    continue
-                  }
-
-                  # DLLs are not in use; clear read-only flags, then overlay.
-                  Get-ChildItem -LiteralPath $dest -Recurse -File -ErrorAction SilentlyContinue |
-                    ForEach-Object { try { $_.IsReadOnly = $false } catch {} }
-                  $null = & robocopy $prod.FullName $dest /E /IS /IT /NFL /NDL /NP /R:2 /W:1 2>&1
-                  $rc = $LASTEXITCODE
-                  $n = @(Get-ChildItem -LiteralPath $prod.FullName -Recurse -File).Count
-                  if ($rc -le 7) {
-                    L ("patch: OK  {0}  ->  {1}   ({2} file(s) overlaid, robocopy exit {3})" -f $prod.Name, $dest, $n, $rc)
-                    $patched++
-                  }
-                  else {
-                    L ("patch: FAILED  {0}  ->  {1}   (robocopy exit {2})" -f $prod.Name, $dest, $rc)
-                    $skipped++
-                  }
-                }
-                foreach ($f in @(Get-ChildItem -LiteralPath $crackDir.FullName -Recurse -File)) {
-                  L ("patch: + {0}" -f $f.FullName.Substring($crackDir.FullName.Length + 1))
-                }
-                L ("patch: finished; product folder(s) patched={0}, skipped/failed={1}" -f $patched, $skipped)
-                Shot 'after_patch'
-              }
-            }
-            catch {
-              L ('patch phase error (continuing to launch): ' + $_.Exception.Message)
-              try { Shot 'patch_error' } catch {}
-            }
 
             if (-not $script:stopReason) {
               $targets = @(Find-AppTarget)
