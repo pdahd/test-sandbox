@@ -8,7 +8,7 @@ on:
         default: "35"
 
 env:
-  PKG_URL: "https://proxy.pdauhd.top/ScenaristBD.zip"
+  PKG_URL: "https://proxy.pdauhd.top/ScenaristBD_v1_Pristine.zip"
   OUT: ${{ github.workspace }}\out
 
 jobs:
