@@ -8,7 +8,7 @@ on:
         default: "35"
 
 env:
-  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=k9jRQMshB7k3Qaly8NKAGUdQiSkXJ1vkHKLXjrR8rsVwydL2VohjaHp4UKG3GNRgAQ"
+  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=SgS_mixNZ8Ne9inWynFPnAONdh4UWKU6nkPZGWVEo1M5umH7PxZimLAMy087g9SMTA"
   OUT: ${{ github.workspace }}\out
 
 jobs:
