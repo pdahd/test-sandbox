@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 env:
-  PKG_URL: "https://proxy.pdauhd.top/ScenaristBD_Portable_YinLiuXia_v1.zip"
+  PKG_URL: "https://proxy.pdauhd.top/ScenaristBD_Portable_v3_YinLiuXia.zip"
   OUT: ${{ github.workspace }}\out
 
 jobs:
@@ -48,7 +48,6 @@ jobs:
 
       # ------------------------------------------------------------------
       - name: 3. Query system dependencies and install missing components
-        if: false
         timeout-minutes: 30
         run: |
           $log = "$env:OUT\logs\dependencies.txt"
