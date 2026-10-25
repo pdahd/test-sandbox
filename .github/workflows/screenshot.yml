@@ -8,7 +8,7 @@ on:
         default: "35"
 
 env:
-  PKG_URL: "https://proxy.pdauhd.top/ScenaristBD_v2_NativeInstaller.zip"
+  PKG_URL: "https://proxy.pdauhd.top/ScenaristBD_v3_FixedPath.zip"
   OUT: ${{ github.workspace }}\out
 
 jobs:
