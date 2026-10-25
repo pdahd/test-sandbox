@@ -8,7 +8,7 @@ on:
         default: "35"
 
 env:
-  PKG_URL: "https://proxy.pdauhd.top/ScenaristBD.zip"
+  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=k9jRQMshB7k3Qaly8NKAGUdQiSkXJ1vkHKLXjrR8rsVwydL2VohjaHp4UKG3GNRgAQ"
   OUT: ${{ github.workspace }}\out
 
 jobs:
