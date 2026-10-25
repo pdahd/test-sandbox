@@ -1,130 +1,124 @@
-name: Scenarist BD Portable - Run with Dependencies
+name: Run Scenarist BD Portable
 
 on:
   workflow_dispatch:
 
-env:
-  PKG_URL: "https://proxy.pdauhd.top/ScenaristBD_Portable_v1.zip"
-  OUT: ${{ github.workspace }}\out
-
 jobs:
   run-portable:
     runs-on: windows-2025
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: powershell
 
     steps:
-      # ------------------------------------------------------------------
-      - name: 1. Initialize directories
-        run: |
-          New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\logs" | Out-Null
-          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          Write-Host "Screen Resolution: $($scr.Width)x$($scr.Height)"
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-      # ------------------------------------------------------------------
-      - name: 2. Download and Extract Portable Package
+      - name: Download Portable Scenarist BD Package
+        shell: powershell
         run: |
-          $f = "$env:RUNNER_TEMP\pkg.bin"
-          curl.exe -L --fail --retry 3 -A "Mozilla/5.0" -o $f "$env:PKG_URL"
-          if ($LASTEXITCODE -ne 0) { throw "Download failed (exit $LASTEXITCODE)" }
+          Write-Host "Downloading ScenaristBD_Portable_v1.zip from Cloudflare Tunnel..."
+          $url = "https://proxy.pdauhd.top/ScenaristBD_Portable_v1.zip"
+          $output = "C:\ScenaristBD_Portable_v1.zip"
+          Invoke-WebRequest -Uri $url -OutFile $output
+          Write-Host "Download completed. File size: $((Get-Item $output).Length) bytes"
 
-          & "C:\Program Files\7-Zip\7z.exe" x $f "-o$env:RUNNER_TEMP\pkg" -y
-          
-          $exe = Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse -Filter "ScenaristBD.exe" | Select-Object -First 1
-          if (-not $exe) { throw "ScenaristBD.exe not found in portable package" }
-          
-          $prereq = Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse -Filter "ISSetupPrerequisites" | Select-Object -First 1
-          
-          Write-Host "Main Executable Found: $($exe.FullName)"
-          "APP_EXE=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "APP_DIR=$($exe.DirectoryName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          if ($prereq) {
-            "PREREQ_DIR=$($prereq.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-            Write-Host "Prerequisites Directory Found: $($prereq.FullName)"
+      - name: Extract Portable Package
+        shell: powershell
+        run: |
+          Write-Host "Extracting portable package to C:\ScenaristBD_Portable..."
+          Expand-Archive -Path "C:\ScenaristBD_Portable_v1.zip" -DestinationPath "C:\ScenaristBD_Portable" -Force
+          Write-Host "Extraction complete."
+
+      - name: Install Prerequisites Silently
+        shell: powershell
+        run: |
+          $prereqDir = "C:\ScenaristBD_Portable\ISSetupPrerequisites"
+          if (Test-Path $prereqDir) {
+              Write-Host "Installing VC++ 2005 Redistributable..."
+              Start-Process -FilePath "$prereqDir\VC2005_x86\vcredist_x86.exe" -ArgumentList "/q" -Wait -NoNewWindow
+
+              Write-Host "Installing .NET Framework 3.5..."
+              dism /online /enable-feature /featurename:NetFx3 /all /quiet /norestart
+
+              Write-Host "Installing JRE 1.5..."
+              Start-Process -FilePath "$prereqDir\JRE1.5\jre-1_5_0_09-windows-i586-p.exe" -ArgumentList "/s /v`"/qn REBOOT=Suppress`"" -Wait -NoNewWindow
+
+              Write-Host "Installing Visual J# 2.0..."
+              Start-Process -FilePath "$prereqDir\VJSharp2.0\vjredist.exe" -ArgumentList "/q /c:`"install.exe /q`"" -Wait -NoNewWindow
+
+              Write-Host "Installing DirectX 9.0c Redist..."
+              Start-Process -FilePath "$prereqDir\DirectX9\DXSETUP.exe" -ArgumentList "/silent" -Wait -NoNewWindow
+          } else {
+              Write-Host "ISSetupPrerequisites directory not found, skipping."
           }
 
-      # ------------------------------------------------------------------
-      - name: 3. Query system dependencies and install missing components
-        timeout-minutes: 30
+      - name: Launch Scenarist BD App
+        shell: powershell
         run: |
-          $log = "$env:OUT\logs\dependencies.txt"
-          function L($m){ $s = "[$(Get-Date -f HH:mm:ss)] $m"; Write-Host $s; Add-Content $log $s }
-          function Installed($rx){ Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -EA SilentlyContinue | ? { $_.DisplayName -match $rx } | % DisplayName }
-          function Run($exe,$a,$label){
-            if (-not $exe -or -not (Test-Path $exe)) { L "$label : installer does not exist, skip"; return }
-            try { $p = Start-Process -FilePath $exe -ArgumentList $a -Wait -PassThru; L "$label : exit $($p.ExitCode)  (0=success 3010=reboot required 1638/5100=already installed or unsupported)" }
-            catch { L "$label : exception $($_.Exception.Message)" } }
-
-          L "=== Windows Installer service ==="
-          Start-Service msiserver -EA SilentlyContinue; L "msiserver: $((Get-Service msiserver).Status)"
-
-          L "=== .NET Framework 2.0 / 3.5 (NetFx3) ==="
-          $fx = Get-WindowsOptionalFeature -Online -FeatureName NetFx3
-          L "NetFx3 current: $($fx.State)"
-          if ($fx.State -ne 'Enabled') {
-            try { $r = Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -EA Stop; L "Enable-WindowsOptionalFeature completed" }
-            catch { L "Enable failed, using DISM: $($_.Exception.Message)"; dism.exe /Online /Enable-Feature /FeatureName:NetFx3 /All /NoRestart | Out-Null; L "dism exit $LASTEXITCODE" }
-            L "NetFx3 now: $((Get-WindowsOptionalFeature -Online -FeatureName NetFx3).State)" }
-
-          L "=== Visual J# 2.0 Redistributable ==="
-          $vjHas = (Installed 'Visual J#') -or (Get-ChildItem "$env:windir\assembly" -Recurse -Filter vjslib.dll -EA SilentlyContinue)
-          if ($vjHas) { L "J# already exists: $(Installed 'Visual J#')" }
-          else { $vj = Get-ChildItem "$env:PREREQ_DIR" -Recurse -Filter vjredist.exe -EA SilentlyContinue | Select -First 1
-                 Run $vj.FullName '/q:a /c:"install.exe /q"' 'J# 2.0'
-                 L "J# after installation: $(Installed 'Visual J#')" }
-
-          L "=== Java Runtime 1.5 (32-bit) ==="
-          $jreHas = (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment\1.5') -or (Installed 'J2SE Runtime Environment 5|Java\(TM\) 2 Runtime|Java 5')
-          if ($jreHas) { L "JRE 1.5 already exists" }
-          else { $jre = Get-ChildItem "$env:PREREQ_DIR" -Recurse -Filter "jre-*.exe" -EA SilentlyContinue | Select -First 1
-                 Run $jre.FullName '/s /v"/qn REBOOT=Suppress"' 'JRE 1.5.0_07'
-                 L "JRE registry: $(Test-Path 'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment\1.5')" }
-
-          L "=== Visual C++ runtimes ==="
-          Installed 'Visual C\+\+' | sort -Unique | % { L "  already exists: $_" }
-          foreach ($a in 'x86','x64') {
-            if (-not (Installed "Visual C\+\+ 2015-20\d\d.*$a")) {
-              $e = "$env:RUNNER_TEMP\vc_$a.exe"; curl.exe -sL -o $e "https://aka.ms/vs/17/release/vc_redist.$a.exe"
-              Run $e '/install /quiet /norestart' "VC++ 2015-2022 $a" } }
-
-          L "=== Legacy DirectX 9 runtime (d3dx9) ==="
-          if (Test-Path "$env:windir\SysWOW64\d3dx9_43.dll") { L "d3dx9_43.dll already exists" }
-          else { $dx = "$env:RUNNER_TEMP\dxwebsetup.exe"
-                 curl.exe -sL --fail -o $dx "https://download.microsoft.com/download/1/7/1/1718CCC4-6315-4D8E-9543-8E28A4E18C4C/dxwebsetup.exe"
-                 if ($LASTEXITCODE -eq 0) { Run $dx '/Q' 'DirectX End-User Runtime' } else { L "dxwebsetup download failed, skip" } }
-
-          L "=== Media Foundation ==="
-          try { $mf = Get-WindowsFeature Server-Media-Foundation -EA Stop; L "Server-Media-Foundation: $($mf.InstallState)"
-                if ($mf.InstallState -ne 'Installed') { $r = Install-WindowsFeature Server-Media-Foundation -EA Stop; L "Installation result: Success=$($r.Success)" } }
-          catch { L "Media Foundation check failed: $($_.Exception.Message)" }
-          L "=== Dependency processing completed ==="
-
-      # ------------------------------------------------------------------
-      - name: 4. Launch Portable Scenarist BD and capture screenshot
-        run: |
-          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-          
-          Write-Host "Launching Portable Scenarist BD..."
-          $p = Start-Process -FilePath $env:APP_EXE -WorkingDirectory $env:APP_DIR -PassThru
-          
+          $appPath = "C:\ScenaristBD_Portable\AuthoringApplication\ScenaristBD.exe"
+          Write-Host "Starting ScenaristBD from $appPath..."
+          $proc = Start-Process -FilePath $appPath -PassThru
+          Write-Host "Process started with PID: $($proc.Id)"
           Start-Sleep -Seconds 12
-          
-          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
-          $g = [System.Drawing.Graphics]::FromImage($b)
-          $g.CopyFromScreen(0,0,0,0,$b.Size)
-          $b.Save("$env:OUT\shots\ScenaristBD_Portable_Running.png")
-          $g.Dispose(); $b.Dispose()
-          
-          Write-Host "Screenshot saved to out/shots/ScenaristBD_Portable_Running.png"
 
-      # ------------------------------------------------------------------
-      - name: 5. Upload artifacts
-        if: always()
+      - name: Minimize Console Windows
+        shell: powershell
+        run: |
+          $code = @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+
+          public class WindowMinimizer {
+              [DllImport("user32.dll")]
+              private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+
+              [DllImport("user32.dll", CharSet = CharSet.Auto)]
+              private static extern int GetWindowText(IntPtr hWnd, StringBuilder strText, int maxCount);
+
+              [DllImport("user32.dll")]
+              private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+              private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+              private const int SW_MINIMIZE = 6;
+
+              public static void MinimizeRunnerConsole() {
+                  EnumWindows((hWnd, lParam) => {
+                      StringBuilder sb = new StringBuilder(256);
+                      GetWindowText(hWnd, sb, 256);
+                      string title = sb.ToString();
+
+                      if (!string.IsNullOrEmpty(title) && (title.Contains("Runner.Listener") || title.Contains("hosted-compute") || title.Contains("cmd.exe") || title.Contains("powershell"))) {
+                          ShowWindow(hWnd, SW_MINIMIZE);
+                      }
+                      return true;
+                  }, IntPtr.Zero);
+              }
+          }
+          "@
+          Add-Type -TypeDefinition $code
+          [WindowMinimizer]::MinimizeRunnerConsole()
+          Start-Sleep -Seconds 2
+
+      - name: Capture Fullscreen Screenshot
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+
+          $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bitmap = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
+
+          $screenshotPath = "C:\ScenaristBD_Portable_Running.png"
+          $bitmap.Save($screenshotPath, [System.Drawing.Imaging.ImageFormat]::Png)
+
+          $graphics.Dispose()
+          $bitmap.Dispose()
+          Write-Host "Screenshot saved to $screenshotPath"
+
+      - name: Upload Running Screenshot
         uses: actions/upload-artifact@v7
         with:
-          name: scenarist-bd-portable-results
-          path: out
+          name: ScenaristBD-Portable-Screenshot
+          path: C:\ScenaristBD_Portable_Running.png
