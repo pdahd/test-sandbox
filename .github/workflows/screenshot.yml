@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 env:
-  PKG_URL: "https://proxy.pdauhd.top/ScenaristBD_Portable_v3_YinLiuXia.zip"
+  PKG_URL: "https://proxy.pdauhd.top/ScenaristBD_Portable_YinLiuXia_v3.zip"
   OUT: ${{ github.workspace }}\out
 
 jobs:
