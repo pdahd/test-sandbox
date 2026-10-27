@@ -1,0 +1,99 @@
+name: RasterCue Portable - Run and Capture Screenshot
+
+on:
+  workflow_dispatch:
+
+env:
+  PKG_URL: "https://1007.filemail.com/api/file/get?filekey=RvoAdZ_M8bPrxMZJHzae0nzK4k5Rk6hDZkYiWltTUSlhayVD8tIN2dO-CJgwzOg&skipcheck=true&skipreg=true"
+  OUT: ${{ github.workspace }}\out
+
+jobs:
+  run-portable:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+      # ------------------------------------------------------------------
+      - name: 1. Initialize directories
+        run: |
+          New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\logs" | Out-Null
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          Write-Host "Screen Resolution: $($scr.Width)x$($scr.Height)"
+
+      # ------------------------------------------------------------------
+      - name: 2. Download and Extract Portable Package
+        run: |
+          $f = "$env:RUNNER_TEMP\RasterCue.zip"
+          curl.exe -L --fail --retry 3 -A "Mozilla/5.0" -o $f "$env:PKG_URL"
+          if ($LASTEXITCODE -ne 0) { throw "Download failed (exit $LASTEXITCODE)" }
+
+          & "C:\Program Files\7-Zip\7z.exe" x $f "-o$env:RUNNER_TEMP\pkg" -y
+          
+          $exe = Get-ChildItem "$env:RUNNER_TEMP\pkg" -Recurse -Filter "RasterCue.exe" | Select-Object -First 1
+          if (-not $exe) { throw "RasterCue.exe not found in portable package" }
+          
+          Write-Host "Main Executable Found: $($exe.FullName)"
+          "APP_EXE=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "APP_DIR=$($exe.DirectoryName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ------------------------------------------------------------------
+      - name: 3. Launch RasterCue and capture screenshot
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          
+          Write-Host "Launching RasterCue..."
+          $p = Start-Process -FilePath $env:APP_EXE -WorkingDirectory $env:APP_DIR -PassThru
+          
+          Start-Sleep -Seconds 12
+          
+          $minCode = '
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+
+          public static class WinConsoleMin {
+            public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+
+            public static void HideConsoles() {
+              EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+                if (IsWindowVisible(hWnd)) {
+                  StringBuilder sb = new StringBuilder(1024);
+                  GetWindowText(hWnd, sb, 1024);
+                  string t = sb.ToString();
+                  if (!string.IsNullOrEmpty(t) && (t.Contains("ProgramData\\GitHub") || t.Contains("hosted-compute") || t.Contains("Runner.Listener") || t.Contains("cmd.exe") || t.Contains("powershell") || t.Contains("WindowsTerminal"))) {
+                    ShowWindow(hWnd, 6);
+                  }
+                }
+                return true;
+              }, IntPtr.Zero);
+            }
+          }
+          '
+          Add-Type -TypeDefinition $minCode
+          [WinConsoleMin]::HideConsoles()
+          Start-Sleep -Seconds 2
+
+          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
+          $g = [System.Drawing.Graphics]::FromImage($b)
+          $g.CopyFromScreen(0,0,0,0,$b.Size)
+          $b.Save("$env:OUT\shots\RasterCue_Running.png")
+          $g.Dispose(); $b.Dispose()
+          
+          Write-Host "Screenshot saved to out/shots/RasterCue_Running.png"
+
+      # ------------------------------------------------------------------
+      - name: 4. Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rastercue-portable-results
+          path: out
