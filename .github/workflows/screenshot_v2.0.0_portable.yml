@@ -1,0 +1,189 @@
+# screenshot.yml v2.0.0 (2026-10-27) - portable (green) edition
+# v2.0.0: download the portable zip (litterbox direct link, 72h expiry!), verify
+#         structure, then simply launch ScenaristBD.exe, wait 15s, take ONE screenshot.
+#         No setup wizard, no patching step - the portable zip is pre-patched.
+# v1.1.0: install original setup.exe + patch overlay after wizard (tested working)
+# v1.0.0: original tested version (download, install, auto-interact, screenshots)
+
+name: Scenarist BD - portable launch & screenshot
+
+on:
+  workflow_dispatch:
+
+env:
+  PORTABLE_URL: "https://litter.catbox.moe/a11vi1.zip"
+  OUT: ${{ github.workspace }}\out
+
+jobs:
+  capture:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell      # Windows PowerShell 5.1
+
+    steps:
+      - name: 1. Desktop check, minimize runner console, and try higher resolution
+        run: |
+          New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\logs" | Out-Null
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          Add-Type @"
+          using System; using System.Text; using System.Runtime.InteropServices;
+          public static class U32 {
+            public delegate bool EnumProc(IntPtr h, IntPtr l);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+            [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+            [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+            public struct DEVMODE {
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName;
+              public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra; public int dmFields;
+              public int dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+              public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName;
+              public short dmLogPixels; public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+              public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight; }
+            [DllImport("user32.dll")] public static extern int EnumDisplaySettings(string n, int mode, ref DEVMODE dm);
+            [DllImport("user32.dll")] public static extern int ChangeDisplaySettings(ref DEVMODE dm, int flags);
+          }
+          "@
+          [void][U32]::SetProcessDPIAware()
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "OS: $($os.Caption) | $($os.Version) | $($os.OSArchitecture)"
+          Write-Host "Session: $((Get-Process -Id $PID).SessionId)  UserInteractive: $([Environment]::UserInteractive)  Explorer: $([bool](Get-Process explorer -EA SilentlyContinue))"
+
+          # Minimize the hosted-compute-agent console. Do not close it.
+          $cb = [U32+EnumProc]{ param($h, $l)
+            if ([U32]::IsWindowVisible($h)) {
+              $sb = New-Object System.Text.StringBuilder 1024
+              [void][U32]::GetWindowText($h, $sb, 1024); $t = $sb.ToString()
+              if ($t -and $t -match 'ProgramData\\GitHub|hosted-compute|Runner\.Listener') {
+                Write-Host "minimize: $t"; [void][U32]::ShowWindow($h, 6) } }
+            $true }
+          [void][U32]::EnumWindows($cb, [IntPtr]::Zero)
+          Get-Process ServerManager -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
+
+          # Try to raise the resolution. The Hyper-V virtual GPU may reject it.
+          $dm = New-Object U32+DEVMODE; $dm.dmSize = [Runtime.InteropServices.Marshal]::SizeOf($dm)
+          [void][U32]::EnumDisplaySettings($null, -1, [ref]$dm)
+          foreach ($res in @(@(1920,1080), @(1600,1200), @(1280,1024))) {
+            $dm.dmPelsWidth = $res[0]; $dm.dmPelsHeight = $res[1]; $dm.dmFields = 0x80000 -bor 0x100000
+            $rc = [U32]::ChangeDisplaySettings([ref]$dm, 0)
+            if ($rc -eq 0) { Write-Host "resolution -> $($res[0])x$($res[1])"; break } else { Write-Host "resolution $($res[0])x$($res[1]) rejected ($rc)" } }
+          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          Write-Host "Screen now: $($scr.Width)x$($scr.Height)"
+
+          # Baseline screenshot. Failure here means there is no interactive desktop.
+          $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
+          $g = [System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen(0,0,0,0,$b.Size)
+          $b.Save("$env:OUT\shots\K_000000_baseline_desktop.png"); $g.Dispose(); $b.Dispose()
+
+      # ------------------------------------------------------------------
+
+      # ------------------------------------------------------------------
+      - name: 2. Download and extract the portable package
+        run: |
+          $f = "$env:RUNNER_TEMP\portable.zip"
+          curl.exe -L --fail --retry 3 --retry-delay 5 -A "Mozilla/5.0" -o $f "$env:PORTABLE_URL"
+          if ($LASTEXITCODE -ne 0) { throw "download failed (curl exit $LASTEXITCODE); the litterbox link expires after 72h - regenerate the portable zip and update PORTABLE_URL" }
+          $fi = Get-Item $f
+          if ($fi.Length -lt 1MB) { Get-Content $f -TotalCount 5; throw "file is too small; probably an error page" }
+          Write-Host "portable.zip size = $($fi.Length)"
+          & "C:\Program Files\7-Zip\7z.exe" x $f "-o$env:RUNNER_TEMP\portable" -y | Select-Object -Last 4
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip extraction failed (exit $LASTEXITCODE)" }
+          $exe = Get-ChildItem "$env:RUNNER_TEMP\portable" -Recurse -Filter ScenaristBD.exe | Select-Object -First 1
+          if (-not $exe) { throw "ScenaristBD.exe not found in the portable package" }
+          "PORTABLE_EXE=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "ScenaristBD.exe => $($exe.FullName)"
+
+      # ------------------------------------------------------------------
+      - name: 3. Verify portable package structure
+        run: |
+          $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $env:PORTABLE_EXE))
+          Write-Host "portable root: $root"
+          Get-ChildItem "$env:RUNNER_TEMP\portable" -Recurse -File |
+            % { "{0,12}  {1}" -f $_.Length, $_.FullName } |
+            Out-File "$env:OUT\logs\portable-tree.txt"
+          $checks = @(
+            "$root\Launch_ScenaristBD.cmd",
+            "$root\ISSetupPrerequisites",
+            "$root\dotnetfx20.exe",
+            "$root\App_Scenarist\Scenarist BD\AuthoringApplication\ScenaristBD.exe",
+            "$root\App_Scenarist\Scenarist BD\AuthoringApplication\traitor.dll",
+            "$root\App_Scenarist\Scenarist BD\AuthoringApplication\version.dll",
+            "$root\App_Scenarist\Scenarist BD\AuthoringApplication\wsock32.dll",
+            "$root\App_Scenarist\Scenarist BD\AuthoringApplication\msvcr71.dll",
+            "$root\App_Scenarist\Scenarist BD-J\HASPJava.dll",
+            "$root\App_Scenarist\Scenarist Safeguard\HASPJava.dll"
+          )
+          $bad = $false
+          foreach ($c in $checks) {
+            if (Test-Path -LiteralPath $c) { Write-Host "OK      $c" }
+            else { Write-Host "MISSING $c"; $bad = $true }
+          }
+          $jre = Get-ChildItem "$root\ISSetupPrerequisites" -Recurse -Filter "jre-1_5_0_07*.exe" -EA SilentlyContinue | Select-Object -First 1
+          $vj  = Get-ChildItem "$root\ISSetupPrerequisites" -Recurse -Filter "vjredist.exe" -EA SilentlyContinue | Select-Object -First 1
+          Write-Host "JRE 1.5 installer present: $([bool]$jre)   VJ# redist present: $([bool]$vj)"
+          if ($bad) { throw "portable package structure check failed" }
+          Write-Host "structure check passed."
+
+      # ------------------------------------------------------------------
+      - name: 4. Minimize console, launch portable ScenaristBD, wait 15s, screenshot
+        timeout-minutes: 5
+        run: |
+          Add-Type @"
+          using System; using System.Text; using System.Runtime.InteropServices;
+          public static class U32 {
+            public delegate bool EnumProc(IntPtr h, IntPtr l);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+            [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+          }
+          "@
+          [void][U32]::SetProcessDPIAware()
+
+          # Minimize the hosted-compute-agent console (same rule as step 1). Do not close it.
+          $cb = [U32+EnumProc]{ param($h, $l)
+            if ([U32]::IsWindowVisible($h)) {
+              $sb = New-Object System.Text.StringBuilder 1024
+              [void][U32]::GetWindowText($h, $sb, 1024); $t = $sb.ToString()
+              if ($t -and $t -match 'ProgramData\\GitHub|hosted-compute|Runner\.Listener') {
+                Write-Host "minimize: $t"; [void][U32]::ShowWindow($h, 6) } }
+            $true }
+          [void][U32]::EnumWindows($cb, [IntPtr]::Zero)
+
+          # Launch the portable ScenaristBD.
+          $exe = $env:PORTABLE_EXE
+          Write-Host "launching: $exe"
+          $app = Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) -PassThru
+
+          # Wait 15 seconds for the main window.
+          Start-Sleep -Seconds 15
+
+          # Single screenshot.
+          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
+          $g = [System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen(0,0,0,0,$b.Size)
+          $b.Save("$env:OUT\shots\portable_launch_15s.png"); $g.Dispose(); $b.Dispose()
+          Write-Host "screenshot saved: portable_launch_15s.png"
+
+          # Launch status evidence.
+          $app.Refresh()
+          $alive = -not $app.HasExited
+          Write-Host "process alive: $alive"
+          if ($alive) { Write-Host "main window title: '$($app.MainWindowTitle)'" }
+          "alive=$alive  title='$($app.MainWindowTitle)'" | Out-File "$env:OUT\logs\launch-status.txt" -Encoding utf8
+
+      # ------------------------------------------------------------------
+      - name: 5. Upload screenshots and logs regardless of result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scenarist-bd-portable-${{ github.run_number }}
+          path: out
+          if-no-files-found: warn
+          retention-days: 14
