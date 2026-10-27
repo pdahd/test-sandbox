@@ -100,7 +100,8 @@ jobs:
       - name: 3. Verify portable package structure
         if: false
         run: |
-          $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $env:PORTABLE_EXE))
+          # 改为推 4 层或者直接用 Get-Item 寻找 Launch_ScenaristBD.cmd 所在目录：
+          $root = Get-ChildItem "$env:RUNNER_TEMP\portable" -Recurse -Filter "Launch_ScenaristBD.cmd" | Select-Object -First 1 | % { $_.DirectoryName }
           Write-Host "portable root: $root"
           Get-ChildItem "$env:RUNNER_TEMP\portable" -Recurse -File |
             % { "{0,12}  {1}" -f $_.Length, $_.FullName } |
@@ -132,6 +133,8 @@ jobs:
       - name: 4. Minimize console, launch portable ScenaristBD, wait 15s, screenshot
         timeout-minutes: 5
         run: |
+          # 在 Step 4 开头加上：
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           Add-Type @"
           using System; using System.Text; using System.Runtime.InteropServices;
           public static class U32 {
