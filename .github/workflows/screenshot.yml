@@ -48,6 +48,7 @@ jobs:
 
       # ------------------------------------------------------------------
       - name: 3. Query system dependencies and install missing components
+        if: false
         timeout-minutes: 30
         run: |
           $log = "$env:OUT\logs\dependencies.txt"
