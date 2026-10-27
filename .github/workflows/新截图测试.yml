@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
 
 env:
-  # 替换规则：测试 v1 时填 v1 直链；测试 v3 时填 v3 直链（目前已预填 v3 直链）
-  PKG_URL: "https://1008.filemail.com/api/file/get?filekey=yGOsp7uUtly68uvj4oJQyQ3k-ig1NWpkp9tH5BUqPI5uCiSweJXX0EtP2EK1JmCtPoqWwviuwCK6kkgUbHUMRyrzq85a5-8&skipcheck=true&skipreg=true"
+  # 替换规则：测试 v1 时填 v1 直链；测试 v3 时填 v3 直链（目前已预填 v1 直链）
+  PKG_URL: "https://1008.filemail.com/api/file/get?filekey=QCpLNSD8xs4eor6BkBbhKfFiUvlN3_BJXXoPOp1cCx3WwFEgkVeoc67e5ik04b01EvdoFaWl_IZCTsqptQ&skipcheck=true&skipreg=true"
   OUT: ${{ github.workspace }}\out
 
 jobs:
