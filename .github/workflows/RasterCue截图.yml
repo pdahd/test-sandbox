@@ -17,8 +17,9 @@ jobs:
 
     steps:
       # ------------------------------------------------------------------
-      - name: 1. Initialize directories
+      - name: 1. Set High Screen Resolution (1920x1080) and Initialize directories
         run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force -EA SilentlyContinue
           New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\logs" | Out-Null
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
@@ -88,7 +89,7 @@ jobs:
           $b.Save("$env:OUT\shots\RasterCue_Running.png")
           $g.Dispose(); $b.Dispose()
           
-          Write-Host "Screenshot saved to out/shots/RasterCue_Running.png"
+          Write-Host "Screenshot saved to out/shots/RasterCue_Running.png (Resolution: $($scr.Width)x$($scr.Height))"
 
       # ------------------------------------------------------------------
       - name: 4. Upload artifacts
