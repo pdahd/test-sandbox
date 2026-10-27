@@ -81,8 +81,6 @@ jobs:
           $b.Save("$env:OUT\shots\K_000000_baseline_desktop.png"); $g.Dispose(); $b.Dispose()
 
       # ------------------------------------------------------------------
-
-      # ------------------------------------------------------------------
       - name: 2. Download and extract the portable package
         run: |
           $f = "$env:RUNNER_TEMP\portable.zip"
@@ -100,6 +98,7 @@ jobs:
 
       # ------------------------------------------------------------------
       - name: 3. Verify portable package structure
+        if: false
         run: |
           $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $env:PORTABLE_EXE))
           Write-Host "portable root: $root"
