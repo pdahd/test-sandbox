@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 env:
-  PKG_URL: "https://1008.filemail.com/api/file/get?filekey=j1TFKEmjdbDQgK4ZHB1Xh_YIIE6MyP-luycXZc1J871pH4pg75EX9pr9wH0yIqbw_nQKfHU43VSUDlPoBnjOsZjsol7pv7XS"
+  PKG_URL: "https://1008.filemail.com/api/file/get?filekey=9aB4DQVL92-M1c6TM3omsxqi3uY2pRYdnWIDUW-syI_VoQYN8Q3BaIKSk5VXRB2da45LpAzy8RAEeMVqdhbvarIb"
   OUT: ${{ github.workspace }}\out
 
 jobs:
