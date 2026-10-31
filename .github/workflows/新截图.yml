@@ -1,11 +1,11 @@
-name: Scenarist BD Single Portable v15.2 - Auto Test & Log Capture
+name: Scenarist BD Single Portable - Auto Test & Clean Log Artifact
 
 on:
   workflow_dispatch:
 
 env:
-  # v15.2 Single Portable Executable Direct URL (with ScenaristBDlog Telemetry)
-  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=YrJEwxuidnqxmN1K8vdYiu0FEWLuxCdEjN34X_ocdS8uUCCIgXmweGEac5eJu4VISVxDxulgygd9BG6wclP5a6WAKixSE-A0N27wsUDqERHfJKHS"
+  # ScenaristBD_SinglePortable_2026-11-1_YLX.exe Direct URL
+  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=7QorT-VnlGi4Q2-VJwOxRypwXS8tYiCs1va22I6VhUCHDugyn8R5YZBh-JI2ncRW66tmkgfWJj1J1bRJZ9XRXpZFJ4A2zZN736-QvtDf"
   OUT: ${{ github.workspace }}\out
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
     steps:
       - name: 1. Initialize Directories and Screen Resolution
         run: |
-          New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\logs" | Out-Null
+          New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\ScenaristBDlog" | Out-Null
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
           Write-Host "Primary Screen Resolution: $($scr.Width)x$($scr.Height)"
@@ -27,7 +27,7 @@ jobs:
       - name: 2. Download Single Portable Executable
         run: |
           $f = "$env:RUNNER_TEMP\ScenaristBD_SinglePortable.exe"
-          Write-Host "Downloading v15.2 single portable executable..."
+          Write-Host "Downloading single portable executable..."
           curl.exe -L --fail --retry 5 --retry-delay 5 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o $f "$env:PKG_URL"
           if ($LASTEXITCODE -ne 0) { throw "Download failed (curl exit $LASTEXITCODE)" }
 
@@ -230,35 +230,38 @@ jobs:
           $proc.WaitForExit(10000)
 
           # -------------------------------------------------------------
-          # Collect generated ScenaristBDlog files
+          # Clean Log Collection: Only collect actual .txt log files
           # -------------------------------------------------------------
           $logSearchDirs = @(
               "$env:APP_DIR\ScenaristBDlog",
-              "$env:USERPROFILE\Desktop\ScenaristBDlog",
-              "$env:TEMP\ScenaristBD_SinglePortable"
+              "$env:USERPROFILE\Desktop\ScenaristBDlog"
           )
-
-          New-Item -ItemType Directory -Force "$env:OUT\ScenaristBDlog" | Out-Null
 
           foreach ($dir in $logSearchDirs) {
               if (Test-Path $dir) {
-                  Write-Host "Collecting logs from: $dir"
-                  Get-ChildItem -Path $dir -Recurse -File | ForEach-Object {
+                  Write-Host "Scanning for session logs in: $dir"
+                  Get-ChildItem -Path $dir -Filter "*.txt" | ForEach-Object {
                       Copy-Item -Path $_.FullName -Destination "$env:OUT\ScenaristBDlog" -Force
-                      Write-Host "Copied log: $($_.Name)"
+                      Write-Host "Copied session log: $($_.Name)"
                   }
               }
           }
 
-          Write-Host "Workflow execution finished. ScenaristBDlog successfully collected."
+          # Also collect the silent prerequisite installation log if present
+          $installLog = "$env:TEMP\ScenaristBD_SinglePortable\install_log.txt"
+          if (Test-Path $installLog) {
+              Copy-Item -Path $installLog -Destination "$env:OUT\ScenaristBDlog\install_log.txt" -Force
+              Write-Host "Copied prerequisite log: install_log.txt"
+          }
 
-      - name: 4. Upload Screenshots and ScenaristBDlog
+          Write-Host "Workflow execution finished. Clean log files collected successfully."
+
+      - name: 4. Upload Clean Screenshots and ScenaristBDlog
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: scenarist-bd-v15.2-results
+          name: scenarist-bd-clean-results
           path: |
             out/shots
             out/ScenaristBDlog
-            out/logs
           if-no-files-found: warn
