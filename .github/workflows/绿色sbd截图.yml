@@ -1,10 +1,9 @@
-name: Scenarist BD 单文件便携版v15.1测试
+name: Scenarist BD 单文件便携版过程弹窗与主界面连环截图测试
 
 on:
   workflow_dispatch:
 
 env:
-  # v15.1 专属单文件直接下载直链
   PKG_URL: "https://1009.filemail.com/api/file/get?filekey=AT0V9kPCE32T2FBcftU6b4HTfELPa5b-ZSYElVp0QSsaLMDW1Lxy1FdoTfnWlZ5WnZd_skYF35NgV_MX9A6o3id8h0HT_fM3VWR2Iz4ZBkmulAg7"
   OUT: ${{ github.workspace }}\out
 
@@ -37,14 +36,22 @@ jobs:
           "APP_EXE=$singleExe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       # ------------------------------------------------------------------
-      - name: 3. Launch Single Portable Executable & Wait for Main Window
+      - name: 3. Launch Executable, Capture Splash & Main Window Screenshots
         timeout-minutes: 10
         run: |
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           
-          Write-Host "Launching Single Portable Executable v15.1 directly..."
-          $p = Start-Process -FilePath $env:APP_EXE -PassThru
-          
+          # 定义截图通用函数
+          function CaptureScreen($filename) {
+            $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
+            $g = [System.Drawing.Graphics]::FromImage($b)
+            $g.CopyFromScreen(0,0,0,0,$b.Size)
+            $b.Save("$env:OUT\shots\$filename")
+            $g.Dispose(); $b.Dispose()
+            Write-Host "[SCREENSHOT] Saved: out/shots/$filename"
+          }
+
           $winDetectCode = '
           using System;
           using System.Text;
@@ -80,71 +87,8 @@ jobs:
           }
           '
           Add-Type -TypeDefinition $winDetectCode
-          
-          # --- 智能轮询等待：等待组件安装完成并唤起主界面（最多等待 4 分钟）---
-          Write-Host "Waiting for environment initialization and ScenaristBD main window..."
-          $maxWaitSeconds = 240
-          $elapsed = 0
-          $sbdProc = $null
-          $foundTitle = ""
 
-          while ($elapsed -lt $maxWaitSeconds) {
-            Start-Sleep -Seconds 5
-            $elapsed += 5
-            
-            $sbdProc = Get-Process -Name "ScenaristBD" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($sbdProc) {
-              $sbdProc.Refresh()
-              $foundTitle = [WinHelper]::FindScenaristTitle([uint32]$sbdProc.Id)
-              if (-not [string]::IsNullOrEmpty($foundTitle)) {
-                Write-Host "Main window detected after ${elapsed}s! Title: '$foundTitle'"
-                break
-              }
-            }
-            Write-Host "Elapsed: ${elapsed}s... (Installing components or launching)"
-          }
-
-          # 稳妥等待 2 秒让 UI 渲染定型
-          Start-Sleep -Seconds 2
-
-          # --- 进程与窗口标题追踪诊断 ---
-          $diagLog = "$env:OUT\logs\process_diagnostics.txt"
-          "==========================================" | Out-File $diagLog -Encoding utf8
-          "PROCESS RUNTIME DIAGNOSTICS & SYSTEM LOGS" | Out-File $diagLog -Append -Encoding utf8
-          "==========================================" | Out-File $diagLog -Append -Encoding utf8
-          
-          if ($sbdProc) {
-            $sbdProc.Refresh()
-            if ([string]::IsNullOrEmpty($foundTitle)) {
-              $foundTitle = [WinHelper]::FindScenaristTitle([uint32]$sbdProc.Id)
-            }
-            "ScenaristBD Process ID: $($sbdProc.Id)" | Out-File $diagLog -Append -Encoding utf8
-            "MainWindowHandle: $($sbdProc.MainWindowHandle)" | Out-File $diagLog -Append -Encoding utf8
-            "MainWindowTitle: '$foundTitle'" | Out-File $diagLog -Append -Encoding utf8
-          } else {
-            "Launcher Process ID: $($p.Id) (Exited: $($p.HasExited))" | Out-File $diagLog -Append -Encoding utf8
-          }
-
-          # 提取并输出单文件内置安装器的完整安装日志
-          $loaderLog = "$env:TEMP\ScenaristBD_SinglePortable\install_log.txt"
-          "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
-          "SINGLE PORTABLE AUTO-INSTALLATION LOG" | Out-File $diagLog -Append -Encoding utf8
-          "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
-          if (Test-Path $loaderLog) {
-            Get-Content $loaderLog | Out-File $diagLog -Append -Encoding utf8
-            Write-Host "=== Auto-Installation Log from Sandbox ==="
-            Get-Content $loaderLog
-          } else {
-            "Warning: install_log.txt not found yet." | Out-File $diagLog -Append -Encoding utf8
-          }
-
-          "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
-          "WINDOWS EVENT LOGS (Application / System Errors)" | Out-File $diagLog -Append -Encoding utf8
-          "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
-          Get-EventLog -LogName Application -Newest 30 -EntryType Error,Warning -EA SilentlyContinue |
-            Format-List TimeGenerated, Source, EventID, Message | Out-String | Out-File $diagLog -Append -Encoding utf8
-
-          # 隐藏终端窗口，截取主界面
+          # 隐藏 PowerShell/CMD 等控制台窗口，让屏幕最干净
           $minCode = '
           using System;
           using System.Text;
@@ -173,23 +117,81 @@ jobs:
           }
           '
           Add-Type -TypeDefinition $minCode
-          [WinConsoleMin]::HideConsoles()
-          Start-Sleep -Seconds 2
 
-          # 截取全屏高清画面
-          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
-          $g = [System.Drawing.Graphics]::FromImage($b)
-          $g.CopyFromScreen(0,0,0,0,$b.Size)
-          $b.Save("$env:OUT\shots\ScenaristBD_SinglePortable_v15_1_Running.png")
-          $g.Dispose(); $b.Dispose()
+          Write-Host "Launching Single Portable Executable v15.1 directly..."
+          $p = Start-Process -FilePath $env:APP_EXE -PassThru
           
-          Write-Host "Screenshot saved to out/shots/ScenaristBD_SinglePortable_v15_1_Running.png"
+          # 1. 启动后第 3 秒：捕获刚弹出的初始化提示窗口！
+          Start-Sleep -Seconds 3
+          [WinConsoleMin]::HideConsoles()
+          Start-Sleep -Milliseconds 500
+          CaptureScreen "01_Splash_Initial_Window.png"
+
+          # 2. 启动后第 20 秒：捕获正在安装组件过程中的窗口状态！
+          Start-Sleep -Seconds 17
+          CaptureScreen "02_Splash_Installing_Dependencies.png"
+
+          # 3. 轮询等待主界面出现并捕获最终成品！
+          Write-Host "Waiting for environment initialization and ScenaristBD main window..."
+          $maxWaitSeconds = 240
+          $elapsed = 20
+          $sbdProc = $null
+          $foundTitle = ""
+
+          while ($elapsed -lt $maxWaitSeconds) {
+            Start-Sleep -Seconds 5
+            $elapsed += 5
+            
+            $sbdProc = Get-Process -Name "ScenaristBD" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($sbdProc) {
+              $sbdProc.Refresh()
+              $foundTitle = [WinHelper]::FindScenaristTitle([uint32]$sbdProc.Id)
+              if (-not [string]::IsNullOrEmpty($foundTitle)) {
+                Write-Host "Main window detected after ${elapsed}s! Title: '$foundTitle'"
+                break
+              }
+            }
+            Write-Host "Elapsed: ${elapsed}s... (Installing components or launching)"
+          }
+
+          Start-Sleep -Seconds 2
+          [WinConsoleMin]::HideConsoles()
+          Start-Sleep -Milliseconds 500
+          CaptureScreen "03_ScenaristBD_Main_Window_Running.png"
+
+          # --- 进程与窗口标题追踪诊断 ---
+          $diagLog = "$env:OUT\logs\process_diagnostics.txt"
+          "==========================================" | Out-File $diagLog -Encoding utf8
+          "PROCESS RUNTIME DIAGNOSTICS & SYSTEM LOGS" | Out-File $diagLog -Append -Encoding utf8
+          "==========================================" | Out-File $diagLog -Append -Encoding utf8
+          
+          if ($sbdProc) {
+            $sbdProc.Refresh()
+            if ([string]::IsNullOrEmpty($foundTitle)) {
+              $foundTitle = [WinHelper]::FindScenaristTitle([uint32]$sbdProc.Id)
+            }
+            "ScenaristBD Process ID: $($sbdProc.Id)" | Out-File $diagLog -Append -Encoding utf8
+            "MainWindowHandle: $($sbdProc.MainWindowHandle)" | Out-File $diagLog -Append -Encoding utf8
+            "MainWindowTitle: '$foundTitle'" | Out-File $diagLog -Append -Encoding utf8
+          } else {
+            "Launcher Process ID: $($p.Id) (Exited: $($p.HasExited))" | Out-File $diagLog -Append -Encoding utf8
+          }
+
+          # 提取并输出完整安装日志
+          $loaderLog = "$env:TEMP\ScenaristBD_SinglePortable\install_log.txt"
+          "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
+          "SINGLE PORTABLE AUTO-INSTALLATION LOG" | Out-File $diagLog -Append -Encoding utf8
+          "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
+          if (Test-Path $loaderLog) {
+            Get-Content $loaderLog | Out-File $diagLog -Append -Encoding utf8
+            Write-Host "=== Auto-Installation Log from Sandbox ==="
+            Get-Content $loaderLog
+          }
 
       # ------------------------------------------------------------------
       - name: 4. Upload artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: scenarist-bd-v15-1-portable-results
+          name: scenarist-bd-v15-1-triple-screenshots
           path: out
