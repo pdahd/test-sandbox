@@ -1,0 +1,233 @@
+name: Scenarist BD Single Portable - Continuous Screen Capture & Auto Test
+
+on:
+  workflow_dispatch:
+
+env:
+  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=AT0V9kPCE32T2FBcftU6b4HTfELPa5b-ZSYElVp0QSsaLMDW1Lxy1FdoTfnWlZ5WnZd_skYF35NgV_MX9A6o3id8h0HT_fM3VWR2Iz4ZBkmulAg7"
+  OUT: ${{ github.workspace }}\out
+
+jobs:
+  run-portable:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+      - name: 1. Initialize Directories and Screen Resolution
+        run: |
+          New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\logs" | Out-Null
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          Write-Host "Primary Screen Resolution: $($scr.Width)x$($scr.Height)"
+
+      - name: 2. Download Single Portable Executable
+        run: |
+          $f = "$env:RUNNER_TEMP\ScenaristBD_SinglePortable.exe"
+          Write-Host "Downloading v15.1 single portable executable..."
+          curl.exe -L --fail --retry 5 --retry-delay 5 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o $f "$env:PKG_URL"
+          if ($LASTEXITCODE -ne 0) { throw "Download failed (curl exit $LASTEXITCODE)" }
+
+          $fi = Get-Item $f
+          Write-Host "Downloaded size: $([math]::Round($fi.Length / 1MB, 2)) MB ($($fi.Length) bytes)"
+          if ($fi.Length -lt 50MB) {
+            Get-Content $f -TotalCount 20 -EA SilentlyContinue
+            throw "Downloaded file is suspiciously small. Expected ~213MB."
+          }
+
+          "APP_EXE=$f" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "APP_DIR=$env:RUNNER_TEMP" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 3. Launch Single Portable and Continuous Screenshot Loop
+        timeout-minutes: 40
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+
+          $winApiCode = @'
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+
+          public static class WinHelper {
+              public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+              [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+              [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+              [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+              [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+              [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+              [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+              [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+              [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+              public const uint WM_COMMAND = 0x0111;
+              public const uint WM_CLOSE   = 0x0010;
+              public const uint BM_CLICK   = 0x00F5;
+
+              public static void HideConsoles() {
+                  EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+                      if (IsWindowVisible(hWnd)) {
+                          StringBuilder sb = new StringBuilder(1024);
+                          GetWindowText(hWnd, sb, 1024);
+                          string t = sb.ToString();
+                          if (!string.IsNullOrEmpty(t) && (
+                              t.Contains("ProgramData\\GitHub") ||
+                              t.Contains("hosted-compute") ||
+                              t.Contains("Runner.Listener") ||
+                              t.Contains("cmd.exe") ||
+                              t.Contains("powershell") ||
+                              t.Contains("WindowsTerminal")
+                          )) {
+                              ShowWindow(hWnd, 6);
+                          }
+                      }
+                      return true;
+                  }, IntPtr.Zero);
+              }
+          }
+          '@
+          Add-Type -TypeDefinition $winApiCode
+
+          function Close-PagingNotice {
+              param([string]$Context = "")
+              $script:closedAny = $false
+              [WinHelper]::EnumWindows({
+                  param($hWnd, $lParam)
+                  if ([WinHelper]::IsWindowVisible($hWnd)) {
+                      $sbTitle = New-Object System.Text.StringBuilder 512
+                      [WinHelper]::GetWindowText($hWnd, $sbTitle, 512) | Out-Null
+                      $title = $sbTitle.ToString()
+
+                      $sbClass = New-Object System.Text.StringBuilder 256
+                      [WinHelper]::GetClassName($hWnd, $sbClass, 256) | Out-Null
+                      $cls = $sbClass.ToString()
+
+                      if ($title -eq 'System Properties' -or ($cls -eq '#32770' -and $title -match 'Properties')) {
+                          $script:isPaging = $false
+                          $script:okBtn = [IntPtr]::Zero
+
+                          [WinHelper]::EnumChildWindows($hWnd, {
+                              param($hChild, $lParamChild)
+                              $sbChildText = New-Object System.Text.StringBuilder 1024
+                              [WinHelper]::GetWindowText($hChild, $sbChildText, 1024) | Out-Null
+                              $childText = $sbChildText.ToString()
+
+                              if ($childText -match 'temporary paging file|paging file configuration') {
+                                  $script:isPaging = $true
+                              }
+                              if ($childText -eq 'OK') {
+                                  $script:okBtn = $hChild
+                              }
+                              return $true
+                          }, [IntPtr]::Zero) | Out-Null
+
+                          if ($script:isPaging -or $title -eq 'System Properties') {
+                              Write-Host "[Close-PagingNotice] Dismissing System Properties dialog (HWND: $hWnd, Context: $Context)..."
+                              if ($script:okBtn -and $script:okBtn -ne [IntPtr]::Zero) {
+                                  [WinHelper]::SendMessage($script:okBtn, [WinHelper]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+                              }
+                              [WinHelper]::PostMessage($hWnd, [WinHelper]::WM_COMMAND, [IntPtr]1, [IntPtr]::Zero) | Out-Null
+                              [WinHelper]::PostMessage($hWnd, [WinHelper]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+                              $script:closedAny = $true
+                          }
+                      }
+                  }
+                  return $true
+              }, [IntPtr]::Zero) | Out-Null
+
+              if ($script:closedAny) {
+                  Start-Sleep -Milliseconds 300
+              }
+          }
+
+          function Take-CleanScreenshot {
+              param(
+                  [string]$Filename,
+                  [string]$Description = ""
+              )
+              Close-PagingNotice -Context $Filename
+              [WinHelper]::HideConsoles()
+              Start-Sleep -Milliseconds 200
+
+              $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $bmp = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
+              $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+              $gfx.CopyFromScreen(0, 0, 0, 0, $bmp.Size)
+              $savePath = Join-Path "$env:OUT\shots" $Filename
+              $bmp.Save($savePath, [System.Drawing.Imaging.ImageFormat]::Png)
+              $gfx.Dispose()
+              $bmp.Dispose()
+
+              Write-Host "[SCREENSHOT] Saved: $Filename - $Description"
+          }
+
+          Close-PagingNotice -Context "Pre-Launch"
+          [WinHelper]::HideConsoles()
+
+          Write-Host "Launching Single Portable Executable: $env:APP_EXE"
+          $proc = Start-Process -FilePath $env:APP_EXE -WorkingDirectory $env:APP_DIR -PassThru
+          Write-Host "Launched Process ID: $($proc.Id)"
+
+          Start-Sleep -Seconds 1
+          Take-CleanScreenshot "01_Splash_Initial_Window.png" "Startup Splash Window"
+
+          $maxWaitSeconds = 600
+          $intervalSeconds = 10
+          $elapsed = 0
+          $shotIndex = 2
+          $mainWindowDetected = $false
+
+          Write-Host "Entering polling loop (waiting for prerequisite installation and main UI)..."
+
+          while ($elapsed -lt $maxWaitSeconds) {
+              Start-Sleep -Seconds $intervalSeconds
+              $elapsed += $intervalSeconds
+
+              $sbdProc = Get-Process -Name "ScenaristBD" -EA SilentlyContinue | Select-Object -First 1
+
+              $shotName = ("{0:D2}_Runtime_T{1}s.png" -f $shotIndex, $elapsed)
+              Take-CleanScreenshot $shotName "Runtime state at T+${elapsed}s"
+              $shotIndex++
+
+              if ($sbdProc) {
+                  $sbdProc.Refresh()
+                  $title = $sbdProc.MainWindowTitle
+                  $hwnd  = $sbdProc.MainWindowHandle
+                  Write-Host "ScenaristBD process found (PID: $($sbdProc.Id), HWND: $hwnd, Title: '$title')"
+
+                  if (![string]::IsNullOrEmpty($title) -and $title -match 'Scenarist BD') {
+                      Write-Host "SUCCESS: Main window loaded with title: '$title'"
+                      $mainWindowDetected = $true
+                      break
+                  }
+              } else {
+                  Write-Host "Elapsed: ${elapsed}s - Prerequisites installing in background..."
+              }
+          }
+
+          Start-Sleep -Seconds 5
+          Take-CleanScreenshot "Final_MainWindow_Success.png" "Scenarist BD Main Window"
+
+          $diagLog = "$env:OUT\logs\execution_summary.txt"
+          $summary = "SCENARIST BD PORTABLE EXECUTION & VERIFICATION LOG`r`n"
+          $summary += "Timestamp: " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "`r`n"
+          $summary += "Main Window Detected: $mainWindowDetected`r`n"
+          if ($sbdProc) {
+              $summary += "Final Process: PID: $($sbdProc.Id), Title: $($sbdProc.MainWindowTitle)`r`n"
+          } else {
+              $summary += "Final Process: Not found`r`n"
+          }
+          $summary += "Screenshots Generated: " + ((Get-ChildItem "$env:OUT\shots\*.png").Count) + "`r`n"
+          $summary | Out-File $diagLog -Encoding utf8
+
+          Write-Host "Workflow execution step finished successfully."
+
+      - name: 4. Upload Screenshots and Logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scenarist-bd-screenshots-and-logs
+          path: out
+          if-no-files-found: warn
