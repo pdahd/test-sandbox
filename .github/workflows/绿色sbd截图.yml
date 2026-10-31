@@ -1,11 +1,11 @@
-name: Scenarist BD 单文件便携版2026-11-1测试
+name: Scenarist BD 单文件便携版v15.0测试
 
 on:
   workflow_dispatch:
 
 env:
-  # 2026-11-1 专属单文件直接下载直链
-  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=Q1YcD5Fefk-b0cb8jxFRsAgts_DrH-EIfRctci4PNSCYo4WM1jWjD9rp8e3iDUzaQ4ivgO7UQo_jeTbbmaafVFWd-q97qJII0JS0BY9q"
+  # v15.0 专属单文件直接下载直链
+  PKG_URL: "https://1008.filemail.com/api/file/get?filekey=9K3cEq-VV6VeAYijotiapSigkjHPJvKmFASFy75FFgOrqGOAzY9LaIVwlfdRg0HFDZV_rtFvFSA8wIWqon0qPitK7e-waeH6ZaeeA-Ve9OJPn8Jh"
   OUT: ${{ github.workspace }}\out
 
 jobs:
@@ -28,8 +28,8 @@ jobs:
       # ------------------------------------------------------------------
       - name: 2. Download Single Portable Executable
         run: |
-          $singleExe = "$env:RUNNER_TEMP\ScenaristBD_SinglePortable_2026-11-1_YLX.exe"
-          Write-Host "Downloading Single Portable Executable..."
+          $singleExe = "$env:RUNNER_TEMP\ScenaristBD_SinglePortable_v15.0_2026-11-1_YLX.exe"
+          Write-Host "Downloading Single Portable Executable v15.0..."
           curl.exe -L --fail --retry 3 -A "Mozilla/5.0" -o $singleExe "$env:PKG_URL"
           if ($LASTEXITCODE -ne 0) { throw "Download failed (exit $LASTEXITCODE)" }
           
@@ -37,14 +37,14 @@ jobs:
           "APP_EXE=$singleExe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       # ------------------------------------------------------------------
-      - name: 3. Launch Single Portable Executable & Capture Diagnostics
+      - name: 3. Launch Single Portable Executable & Capture Complete Logs
         run: |
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           
-          Write-Host "Launching Single Portable Executable directly..."
+          Write-Host "Launching Single Portable Executable v15.0 directly..."
           $p = Start-Process -FilePath $env:APP_EXE -PassThru
           
-          # 注册 Win32 原生窗口探测工具类，确保日志 100% 能够抓取到真实窗口标题
+          # 注册 Win32 窗口枚举类，确保 100% 精确捕获主窗口标题
           $winDetectCode = '
           using System;
           using System.Text;
@@ -69,7 +69,7 @@ jobs:
                     string t = sb.ToString();
                     if (!string.IsNullOrEmpty(t) && t.Contains("Scenarist")) {
                       result = t;
-                      return false; // 找到即停
+                      return false;
                     }
                   }
                 }
@@ -81,8 +81,8 @@ jobs:
           '
           Add-Type -TypeDefinition $winDetectCode
           
-          # 等待单文件微型沙盒初始化并唤起主程序
-          Start-Sleep -Seconds 15
+          # 给予沙箱解压、环境自检与静默安装充足的时间
+          Start-Sleep -Seconds 20
           
           # --- 进程与窗口标题追踪诊断 ---
           $diagLog = "$env:OUT\logs\process_diagnostics.txt"
@@ -93,8 +93,6 @@ jobs:
           $sbdProc = Get-Process -Name "ScenaristBD" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($sbdProc) {
             $sbdProc.Refresh()
-            
-            # 使用 Win32 原生枚举探测，防止 .NET Process 缓存延迟导致标题为空
             $winTitle = [WinHelper]::FindScenaristTitle([uint32]$sbdProc.Id)
             if ([string]::IsNullOrEmpty($winTitle)) {
               $winTitle = $sbdProc.MainWindowTitle
@@ -107,13 +105,26 @@ jobs:
             "Launcher Process ID: $($p.Id) (Exited: $($p.HasExited))" | Out-File $diagLog -Append -Encoding utf8
           }
 
+          # 提取并合并单文件启动器记录的真实底层安装日志
+          $loaderLog = "$env:TEMP\ScenaristBD_SinglePortable\install_log.txt"
+          "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
+          "SINGLE PORTABLE AUTO-INSTALLATION LOG" | Out-File $diagLog -Append -Encoding utf8
+          "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
+          if (Test-Path $loaderLog) {
+            Get-Content $loaderLog | Out-File $diagLog -Append -Encoding utf8
+            Write-Host "=== Auto-Installation Log from Sandbox ==="
+            Get-Content $loaderLog
+          } else {
+            "Warning: install_log.txt not found yet." | Out-File $diagLog -Append -Encoding utf8
+          }
+
           "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
           "WINDOWS EVENT LOGS (Application / System Errors)" | Out-File $diagLog -Append -Encoding utf8
           "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
           Get-EventLog -LogName Application -Newest 30 -EntryType Error,Warning -EA SilentlyContinue |
             Format-List TimeGenerated, Source, EventID, Message | Out-String | Out-File $diagLog -Append -Encoding utf8
 
-          # 隐藏终端窗口，准备截取高清主窗口
+          # 隐藏终端窗口，截取主界面
           $minCode = '
           using System;
           using System.Text;
@@ -150,15 +161,15 @@ jobs:
           $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
           $g = [System.Drawing.Graphics]::FromImage($b)
           $g.CopyFromScreen(0,0,0,0,$b.Size)
-          $b.Save("$env:OUT\shots\ScenaristBD_SinglePortable_Running.png")
+          $b.Save("$env:OUT\shots\ScenaristBD_SinglePortable_v15_Running.png")
           $g.Dispose(); $b.Dispose()
           
-          Write-Host "Screenshot saved to out/shots/ScenaristBD_SinglePortable_Running.png"
+          Write-Host "Screenshot saved to out/shots/ScenaristBD_SinglePortable_v15_Running.png"
 
       # ------------------------------------------------------------------
       - name: 4. Upload artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: scenarist-bd-single-portable-results
+          name: scenarist-bd-v15-portable-results
           path: out
