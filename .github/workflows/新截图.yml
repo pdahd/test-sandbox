@@ -1,11 +1,11 @@
-name: Scenarist BD Single Portable v16 - Auto Test & Clean Log Artifact
+name: Scenarist BD Single Portable - Auto Test & Clean Log Artifact
 
 on:
   workflow_dispatch:
 
 env:
-  # ScenaristBD_SinglePortable_v16_2026-11-1_YLX.exe Direct URL
-  PKG_URL: "https://1007.filemail.com/api/file/get?filekey=5aebm7ejI77FGAe53qSAtA2s9tYVuwYEjbIVzZ2iu8MC4L-Yg4lbVjRKUKQrWxGCcA6oly663WYFyfZDyhLPcf7uvdIQMYwO1Oaxi5tLuX3QDQ"
+  # ScenaristBD_SinglePortable_2026-11-1_YLX.exe Direct URL
+  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=7QorT-VnlGi4Q2-VJwOxRypwXS8tYiCs1va22I6VhUCHDugyn8R5YZBh-JI2ncRW66tmkgfWJj1J1bRJZ9XRXpZFJ4A2zZN736-QvtDf"
   OUT: ${{ github.workspace }}\out
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
       - name: 2. Download Single Portable Executable
         run: |
           $f = "$env:RUNNER_TEMP\ScenaristBD_SinglePortable.exe"
-          Write-Host "Downloading single portable v16 executable..."
+          Write-Host "Downloading single portable executable..."
           curl.exe -L --fail --retry 5 --retry-delay 5 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o $f "$env:PKG_URL"
           if ($LASTEXITCODE -ne 0) { throw "Download failed (curl exit $LASTEXITCODE)" }
 
@@ -260,7 +260,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: scenarist-bd-v16-results
+          name: scenarist-bd-clean-results
           path: |
             out/shots
             out/ScenaristBDlog
