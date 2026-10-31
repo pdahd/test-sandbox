@@ -1,10 +1,11 @@
-name: Scenarist BD Single Portable - Continuous Screen Capture & Auto Test
+name: Scenarist BD Single Portable v15.2 - Auto Test & Log Capture
 
 on:
   workflow_dispatch:
 
 env:
-  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=AT0V9kPCE32T2FBcftU6b4HTfELPa5b-ZSYElVp0QSsaLMDW1Lxy1FdoTfnWlZ5WnZd_skYF35NgV_MX9A6o3id8h0HT_fM3VWR2Iz4ZBkmulAg7"
+  # v15.2 Single Portable Executable Direct URL (with ScenaristBDlog Telemetry)
+  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=YrJEwxuidnqxmN1K8vdYiu0FEWLuxCdEjN34X_ocdS8uUCCIgXmweGEac5eJu4VISVxDxulgygd9BG6wclP5a6WAKixSE-A0N27wsUDqERHfJKHS"
   OUT: ${{ github.workspace }}\out
 
 jobs:
@@ -26,7 +27,7 @@ jobs:
       - name: 2. Download Single Portable Executable
         run: |
           $f = "$env:RUNNER_TEMP\ScenaristBD_SinglePortable.exe"
-          Write-Host "Downloading v15.1 single portable executable..."
+          Write-Host "Downloading v15.2 single portable executable..."
           curl.exe -L --fail --retry 5 --retry-delay 5 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o $f "$env:PKG_URL"
           if ($LASTEXITCODE -ne 0) { throw "Download failed (curl exit $LASTEXITCODE)" }
 
@@ -40,7 +41,7 @@ jobs:
           "APP_EXE=$f" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "APP_DIR=$env:RUNNER_TEMP" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: 3. Launch Single Portable and Continuous Screenshot Loop
+      - name: 3. Launch Portable, Continuous Screenshots, and Graceful Process Exit
         timeout-minutes: 40
         run: |
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -168,7 +169,7 @@ jobs:
 
           Write-Host "Launching Single Portable Executable: $env:APP_EXE"
           $proc = Start-Process -FilePath $env:APP_EXE -WorkingDirectory $env:APP_DIR -PassThru
-          Write-Host "Launched Process ID: $($proc.Id)"
+          Write-Host "Launched Loader Process ID: $($proc.Id)"
 
           Start-Sleep -Seconds 1
           Take-CleanScreenshot "01_Splash_Initial_Window.png" "Startup Splash Window"
@@ -177,7 +178,7 @@ jobs:
           $intervalSeconds = 10
           $elapsed = 0
           $shotIndex = 2
-          $mainWindowDetected = $false
+          $sbdProc = $null
 
           Write-Host "Entering polling loop (waiting for prerequisite installation and main UI)..."
 
@@ -199,7 +200,6 @@ jobs:
 
                   if (![string]::IsNullOrEmpty($title) -and $title -match 'Scenarist BD') {
                       Write-Host "SUCCESS: Main window loaded with title: '$title'"
-                      $mainWindowDetected = $true
                       break
                   }
               } else {
@@ -210,24 +210,55 @@ jobs:
           Start-Sleep -Seconds 5
           Take-CleanScreenshot "Final_MainWindow_Success.png" "Scenarist BD Main Window"
 
-          $diagLog = "$env:OUT\logs\execution_summary.txt"
-          $summary = "SCENARIST BD PORTABLE EXECUTION & VERIFICATION LOG`r`n"
-          $summary += "Timestamp: " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "`r`n"
-          $summary += "Main Window Detected: $mainWindowDetected`r`n"
-          if ($sbdProc) {
-              $summary += "Final Process: PID: $($sbdProc.Id), Title: $($sbdProc.MainWindowTitle)`r`n"
-          } else {
-              $summary += "Final Process: Not found`r`n"
+          # -------------------------------------------------------------
+          # Gracefully close ScenaristBD to trigger log generation
+          # -------------------------------------------------------------
+          Write-Host "Closing ScenaristBD to finalize session and trigger ScenaristBDlog generation..."
+          if ($sbdProc -and (-not $sbdProc.HasExited)) {
+              if ($sbdProc.MainWindowHandle -and $sbdProc.MainWindowHandle -ne [IntPtr]::Zero) {
+                  [WinHelper]::PostMessage($sbdProc.MainWindowHandle, [WinHelper]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+              }
+              $closedGracefully = $sbdProc.WaitForExit(5000)
+              if (-not $closedGracefully) {
+                  Write-Host "Sending Stop-Process to ScenaristBD..."
+                  Stop-Process -Id $sbdProc.Id -Force -EA SilentlyContinue
+              }
           }
-          $summary += "Screenshots Generated: " + ((Get-ChildItem "$env:OUT\shots\*.png").Count) + "`r`n"
-          $summary | Out-File $diagLog -Encoding utf8
 
-          Write-Host "Workflow execution step finished successfully."
+          # Wait for loader process to exit and finalize logs
+          Write-Host "Waiting for loader process to finalize logs..."
+          $proc.WaitForExit(10000)
 
-      - name: 4. Upload Screenshots and Logs
+          # -------------------------------------------------------------
+          # Collect generated ScenaristBDlog files
+          # -------------------------------------------------------------
+          $logSearchDirs = @(
+              "$env:APP_DIR\ScenaristBDlog",
+              "$env:USERPROFILE\Desktop\ScenaristBDlog",
+              "$env:TEMP\ScenaristBD_SinglePortable"
+          )
+
+          New-Item -ItemType Directory -Force "$env:OUT\ScenaristBDlog" | Out-Null
+
+          foreach ($dir in $logSearchDirs) {
+              if (Test-Path $dir) {
+                  Write-Host "Collecting logs from: $dir"
+                  Get-ChildItem -Path $dir -Recurse -File | ForEach-Object {
+                      Copy-Item -Path $_.FullName -Destination "$env:OUT\ScenaristBDlog" -Force
+                      Write-Host "Copied log: $($_.Name)"
+                  }
+              }
+          }
+
+          Write-Host "Workflow execution finished. ScenaristBDlog successfully collected."
+
+      - name: 4. Upload Screenshots and ScenaristBDlog
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: scenarist-bd-screenshots-and-logs
-          path: out
+          name: scenarist-bd-v15.2-results
+          path: |
+            out/shots
+            out/ScenaristBDlog
+            out/logs
           if-no-files-found: warn
