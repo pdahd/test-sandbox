@@ -1,11 +1,11 @@
-name: Scenarist BD 单文件便携版v14截图测试
+name: Scenarist BD 单文件便携版2026-11-1测试
 
 on:
   workflow_dispatch:
 
 env:
-  # v14 真正的单文件绿色便携版直链
-  PKG_URL: "https://1008.filemail.com/api/file/get?filekey=SHZSQNAS6dn7ajQVMgHSjDDmdZizyQFAhmN9OkWR6ZxzSWzL1XuiuKdhH9kbSPP2l7BYS8zrUjwjPxqCf6jrw8c5Otlrwv7o"
+  # 2026-11-1 专属单文件直接下载直链
+  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=Q1YcD5Fefk-b0cb8jxFRsAgts_DrH-EIfRctci4PNSCYo4WM1jWjD9rp8e3iDUzaQ4ivgO7UQo_jeTbbmaafVFWd-q97qJII0JS0BY9q"
   OUT: ${{ github.workspace }}\out
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: 2. Download Single Portable Executable
         run: |
-          $singleExe = "$env:RUNNER_TEMP\ScenaristBD_SinglePortable_v14_YLX.exe"
+          $singleExe = "$env:RUNNER_TEMP\ScenaristBD_SinglePortable_2026-11-1_YLX.exe"
           Write-Host "Downloading Single Portable Executable..."
           curl.exe -L --fail --retry 3 -A "Mozilla/5.0" -o $singleExe "$env:PKG_URL"
           if ($LASTEXITCODE -ne 0) { throw "Download failed (exit $LASTEXITCODE)" }
@@ -42,8 +42,44 @@ jobs:
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           
           Write-Host "Launching Single Portable Executable directly..."
-          # 直接单文件双击启动！
           $p = Start-Process -FilePath $env:APP_EXE -PassThru
+          
+          # 注册 Win32 原生窗口探测工具类，确保日志 100% 能够抓取到真实窗口标题
+          $winDetectCode = '
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+
+          public static class WinHelper {
+            public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+            public static string FindScenaristTitle(uint pid) {
+              string result = "";
+              EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+                if (IsWindowVisible(hWnd)) {
+                  uint procId;
+                  GetWindowThreadProcessId(hWnd, out procId);
+                  if (procId == pid) {
+                    StringBuilder sb = new StringBuilder(1024);
+                    GetWindowText(hWnd, sb, 1024);
+                    string t = sb.ToString();
+                    if (!string.IsNullOrEmpty(t) && t.Contains("Scenarist")) {
+                      result = t;
+                      return false; // 找到即停
+                    }
+                  }
+                }
+                return true;
+              }, IntPtr.Zero);
+              return result;
+            }
+          }
+          '
+          Add-Type -TypeDefinition $winDetectCode
           
           # 等待单文件微型沙盒初始化并唤起主程序
           Start-Sleep -Seconds 15
@@ -54,12 +90,19 @@ jobs:
           "PROCESS RUNTIME DIAGNOSTICS & SYSTEM LOGS" | Out-File $diagLog -Append -Encoding utf8
           "==========================================" | Out-File $diagLog -Append -Encoding utf8
           
-          # 寻找正在运行的 ScenaristBD 主进程
           $sbdProc = Get-Process -Name "ScenaristBD" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($sbdProc) {
+            $sbdProc.Refresh()
+            
+            # 使用 Win32 原生枚举探测，防止 .NET Process 缓存延迟导致标题为空
+            $winTitle = [WinHelper]::FindScenaristTitle([uint32]$sbdProc.Id)
+            if ([string]::IsNullOrEmpty($winTitle)) {
+              $winTitle = $sbdProc.MainWindowTitle
+            }
+
             "ScenaristBD Process ID: $($sbdProc.Id)" | Out-File $diagLog -Append -Encoding utf8
             "MainWindowHandle: $($sbdProc.MainWindowHandle)" | Out-File $diagLog -Append -Encoding utf8
-            "MainWindowTitle: '$($sbdProc.MainWindowTitle)'" | Out-File $diagLog -Append -Encoding utf8
+            "MainWindowTitle: '$winTitle'" | Out-File $diagLog -Append -Encoding utf8
           } else {
             "Launcher Process ID: $($p.Id) (Exited: $($p.HasExited))" | Out-File $diagLog -Append -Encoding utf8
           }
@@ -70,7 +113,7 @@ jobs:
           Get-EventLog -LogName Application -Newest 30 -EntryType Error,Warning -EA SilentlyContinue |
             Format-List TimeGenerated, Source, EventID, Message | Out-String | Out-File $diagLog -Append -Encoding utf8
 
-          # 隐藏终端窗口，准备抓图
+          # 隐藏终端窗口，准备截取高清主窗口
           $minCode = '
           using System;
           using System.Text;
