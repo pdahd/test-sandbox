@@ -1,0 +1,121 @@
+name: Scenarist BD 单文件便携版v14截图测试
+
+on:
+  workflow_dispatch:
+
+env:
+  # v14 真正的单文件绿色便携版直链
+  PKG_URL: "https://1008.filemail.com/api/file/get?filekey=SHZSQNAS6dn7ajQVMgHSjDDmdZizyQFAhmN9OkWR6ZxzSWzL1XuiuKdhH9kbSPP2l7BYS8zrUjwjPxqCf6jrw8c5Otlrwv7o"
+  OUT: ${{ github.workspace }}\out
+
+jobs:
+  run-single-portable:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+      # ------------------------------------------------------------------
+      - name: 1. Initialize directories
+        run: |
+          New-Item -ItemType Directory -Force "$env:OUT\shots","$env:OUT\logs" | Out-Null
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          Write-Host "Screen Resolution: $($scr.Width)x$($scr.Height)"
+
+      # ------------------------------------------------------------------
+      - name: 2. Download Single Portable Executable
+        run: |
+          $singleExe = "$env:RUNNER_TEMP\ScenaristBD_SinglePortable_v14_YLX.exe"
+          Write-Host "Downloading Single Portable Executable..."
+          curl.exe -L --fail --retry 3 -A "Mozilla/5.0" -o $singleExe "$env:PKG_URL"
+          if ($LASTEXITCODE -ne 0) { throw "Download failed (exit $LASTEXITCODE)" }
+          
+          Write-Host "Downloaded: $((Get-Item $singleExe).Length / 1MB) MB"
+          "APP_EXE=$singleExe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ------------------------------------------------------------------
+      - name: 3. Launch Single Portable Executable & Capture Diagnostics
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          
+          Write-Host "Launching Single Portable Executable directly..."
+          # 直接单文件双击启动！
+          $p = Start-Process -FilePath $env:APP_EXE -PassThru
+          
+          # 等待单文件微型沙盒初始化并唤起主程序
+          Start-Sleep -Seconds 15
+          
+          # --- 进程与窗口标题追踪诊断 ---
+          $diagLog = "$env:OUT\logs\process_diagnostics.txt"
+          "==========================================" | Out-File $diagLog -Encoding utf8
+          "PROCESS RUNTIME DIAGNOSTICS & SYSTEM LOGS" | Out-File $diagLog -Append -Encoding utf8
+          "==========================================" | Out-File $diagLog -Append -Encoding utf8
+          
+          # 寻找正在运行的 ScenaristBD 主进程
+          $sbdProc = Get-Process -Name "ScenaristBD" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($sbdProc) {
+            "ScenaristBD Process ID: $($sbdProc.Id)" | Out-File $diagLog -Append -Encoding utf8
+            "MainWindowHandle: $($sbdProc.MainWindowHandle)" | Out-File $diagLog -Append -Encoding utf8
+            "MainWindowTitle: '$($sbdProc.MainWindowTitle)'" | Out-File $diagLog -Append -Encoding utf8
+          } else {
+            "Launcher Process ID: $($p.Id) (Exited: $($p.HasExited))" | Out-File $diagLog -Append -Encoding utf8
+          }
+
+          "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
+          "WINDOWS EVENT LOGS (Application / System Errors)" | Out-File $diagLog -Append -Encoding utf8
+          "------------------------------------------" | Out-File $diagLog -Append -Encoding utf8
+          Get-EventLog -LogName Application -Newest 30 -EntryType Error,Warning -EA SilentlyContinue |
+            Format-List TimeGenerated, Source, EventID, Message | Out-String | Out-File $diagLog -Append -Encoding utf8
+
+          # 隐藏终端窗口，准备抓图
+          $minCode = '
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+
+          public static class WinConsoleMin {
+            public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+
+            public static void HideConsoles() {
+              EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+                if (IsWindowVisible(hWnd)) {
+                  StringBuilder sb = new StringBuilder(1024);
+                  GetWindowText(hWnd, sb, 1024);
+                  string t = sb.ToString();
+                  if (!string.IsNullOrEmpty(t) && (t.Contains("ProgramData\\GitHub") || t.Contains("hosted-compute") || t.Contains("Runner.Listener") || t.Contains("cmd.exe") || t.Contains("powershell") || t.Contains("WindowsTerminal"))) {
+                    ShowWindow(hWnd, 6);
+                  }
+                }
+                return true;
+              }, IntPtr.Zero);
+            }
+          }
+          '
+          Add-Type -TypeDefinition $minCode
+          [WinConsoleMin]::HideConsoles()
+          Start-Sleep -Seconds 2
+
+          # 截取全屏
+          $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $b = New-Object System.Drawing.Bitmap $scr.Width, $scr.Height
+          $g = [System.Drawing.Graphics]::FromImage($b)
+          $g.CopyFromScreen(0,0,0,0,$b.Size)
+          $b.Save("$env:OUT\shots\ScenaristBD_SinglePortable_Running.png")
+          $g.Dispose(); $b.Dispose()
+          
+          Write-Host "Screenshot saved to out/shots/ScenaristBD_SinglePortable_Running.png"
+
+      # ------------------------------------------------------------------
+      - name: 4. Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scenarist-bd-single-portable-results
+          path: out
