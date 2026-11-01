@@ -5,7 +5,7 @@ on:
 
 env:
   # ScenaristBD_SinglePortable_2026-11-1_YLX.exe Direct URL
-  PKG_URL: "https://1008.filemail.com/api/file/get?filekey=93mFoukNEv74mHxw7xVT4oinnX5hCTiDJEfYe3JBwXNlRtwIPn6bU6-8IIBfAs9RAUPJWjeGhoNwaXyIQY3SyoGGWmoQeG5YGE6kwHSKv_pXGA"
+  PKG_URL: "https://1009.filemail.com/api/file/get?filekey=fG4ZtukSi5MtyW3ELYr6QBddnpcB63NXjq4OubJ5364XfQShMN_lsFvhl0V-p98QjMeZ8AzXxeTSrq3V_RBunEYmtqLwDqss-hJ_KBORSlojfo3l"
   OUT: ${{ github.workspace }}\out
 
 jobs:
